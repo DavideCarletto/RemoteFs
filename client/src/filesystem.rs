@@ -1,11 +1,17 @@
 use fuser::Filesystem;
 use log::{warn, debug};
 
-struct RemoteFs{
-
+pub struct RemoteFsClient {
+    api_url: String
 }
 
-impl Filesystem for RemoteFs {
+impl RemoteFsClient {
+    pub fn new(api_url: String) -> Self {
+        Self { api_url }
+    }
+}
+
+impl Filesystem for RemoteFsClient {
     fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> Result<(), libc::c_int> {
         Ok(())
     }
