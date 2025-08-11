@@ -1,0 +1,1 @@
+/mnt/c/Users/Davide/Projects/RustProjects/remote_fs/target/debug/libremote_fs.rlib: /mnt/c/Users/Davide/Projects/RustProjects/remote_fs/src/filesystem.rs /mnt/c/Users/Davide/Projects/RustProjects/remote_fs/src/lib.rs
