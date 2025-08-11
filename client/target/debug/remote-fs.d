@@ -1,1 +1,0 @@
-/mnt/c/Users/Davide/Projects/RustProjects/remote-fs/target/debug/remote-fs: /mnt/c/Users/Davide/Projects/RustProjects/remote-fs/src/filesystem.rs /mnt/c/Users/Davide/Projects/RustProjects/remote-fs/src/lib.rs /mnt/c/Users/Davide/Projects/RustProjects/remote-fs/src/main.rs
