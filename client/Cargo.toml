@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = "4.5.44"
 fuser = "0.15"
 libc = "0.2.175"
 log = "0.4"
+reqwest = { version = "0.12.22", features = ["blocking", "json"] }

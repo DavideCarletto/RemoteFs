@@ -1,8 +1,9 @@
 use fuser::Filesystem;
-use log::{warn, debug};
+use log::{debug, warn};
+use reqwest::blocking::Client;
 
 pub struct RemoteFsClient {
-    api_url: String
+    api_url: String,
 }
 
 impl RemoteFsClient {
@@ -12,13 +13,38 @@ impl RemoteFsClient {
 }
 
 impl Filesystem for RemoteFsClient {
-    fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> Result<(), libc::c_int> {
-        Ok(())
+    fn init(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        let health_url = format!("{}/health", self.api_url);
+        let client = Client::new();
+        match client.get(&health_url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                config.set_max_readahead(128 * 1024).ok();
+                config.set_max_write(128 * 1024).ok();
+                println!("Remote FS client initialized successfully.");
+                Ok(())
+            }
+            _ => {
+                eprintln!(
+                    "Errore: impossibile raggiungere il server API all'URL {}",
+                    health_url
+                );
+                Err(libc::EIO)
+            }
+        }
     }
-
     fn destroy(&mut self) {}
 
-    fn lookup(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEntry) {
+    fn lookup(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
         warn!(
             "[Not Implemented] lookup(parent: {:#x?}, name {:?})",
             parent, name
@@ -28,7 +54,13 @@ impl Filesystem for RemoteFsClient {
 
     fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {}
 
-    fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: Option<u64>, reply: fuser::ReplyAttr) {
+    fn getattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: Option<u64>,
+        reply: fuser::ReplyAttr,
+    ) {
         warn!(
             "[Not Implemented] getattr(ino: {:#x?}, fh: {:#x?})",
             ino, fh
@@ -101,7 +133,13 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn unlink(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
+    fn unlink(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
             "[Not Implemented] unlink(parent: {:#x?}, name: {:?})",
             parent, name,
@@ -109,7 +147,13 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn rmdir(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
+    fn rmdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
             "[Not Implemented] rmdir(parent: {:#x?}, name: {:?})",
             parent, name,
@@ -214,7 +258,14 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn flush(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: fuser::ReplyEmpty) {
+    fn flush(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
             "[Not Implemented] flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
             ino, fh, lock_owner
@@ -235,7 +286,14 @@ impl Filesystem for RemoteFsClient {
         reply.ok();
     }
 
-    fn fsync(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, datasync: bool, reply: fuser::ReplyEmpty) {
+    fn fsync(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
             "[Not Implemented] fsync(ino: {:#x?}, fh: {}, datasync: {})",
             ino, fh, datasync
@@ -243,7 +301,13 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn opendir(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+    fn opendir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _flags: i32,
+        reply: fuser::ReplyOpen,
+    ) {
         reply.opened(0, 0);
     }
 
@@ -339,7 +403,13 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn listxattr(&mut self, _req: &fuser::Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+    fn listxattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
         debug!(
             "[Not Implemented] listxattr(ino: {:#x?}, size: {})",
             ino, size
@@ -347,7 +417,13 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn removexattr(&mut self, _req: &fuser::Request<'_>, ino: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
+    fn removexattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
             "[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
             ino, name
@@ -419,7 +495,14 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn bmap(&mut self, _req: &fuser::Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: fuser::ReplyBmap) {
+    fn bmap(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        blocksize: u32,
+        idx: u64,
+        reply: fuser::ReplyBmap,
+    ) {
         debug!(
             "[Not Implemented] bmap(ino: {:#x?}, blocksize: {}, idx: {})",
             ino, blocksize, idx,

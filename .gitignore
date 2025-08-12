@@ -1,1 +1,9 @@
-/client/target
+# Rust
+/client/target/
+/client/Cargo.lock
+**/*.rs.bk
+
+# Node/TypeScript
+/server/node_modules/
+/server/dist/
+/server/.env
