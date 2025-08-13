@@ -52,3 +52,7 @@ cargo run
 - Tutti i comandi vanno eseguiti in una shell WSL.
 
 
+**TODO**
+- Una volta finito di sviluppare, eliminare possibilità di scegliere se daemon o no (dovrebbe partire a prescindere daemon)
+- Per il logging di fern, a fine sviluppo cambiare da truncate ad append
+- Nn main, mettere .level(log::LevelFilter::Debug) a info una volta finito
