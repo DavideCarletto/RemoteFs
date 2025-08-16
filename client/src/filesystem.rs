@@ -166,6 +166,142 @@ impl RemoteFsClient {
             }
         }
     }
+
+    /// Crea un nuovo filesystem object (file, directory, etc.) sul server tramite chiamata HTTP
+    fn create_filesystem_object(&self, path: &str, file_type: &str, mode: u32, uid: u32, gid: u32, rdev: u32, umask: u32) -> Result<FileMetadata, i32> {
+        debug!("Creazione filesystem object: {} tipo: {}", path, file_type);
+        
+        let create_data = serde_json::json!({
+            "path": path,
+            "file_type": file_type,
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "rdev": rdev,
+            "umask": umask
+        });
+
+        let client = Client::new();
+        let url = format!("{}/create", self.api_url);
+
+        match client.post(&url).json(&create_data).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<FileMetadata>() {
+                    Ok(metadata) => {
+                        info!("File creato: {} -> inode {}", path, metadata.ino);
+                        Ok(metadata)
+                    }
+                    Err(e) => {
+                        error!("Errore parsing JSON in creazione per {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                warn!("File già esistente: {}", path);
+                Err(libc::EEXIST)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("Directory padre non trovata per: {}", path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                warn!("Permessi insufficienti per creare: {}", path);
+                Err(libc::EACCES)
+            }
+            Ok(resp) => {
+                error!("Errore server in creazione per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in creazione per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Rimuove un filesystem object (file, directory, etc.) dal server tramite chiamata HTTP
+    fn remove_filesystem_object(&self, path: &str, is_directory: bool) -> Result<(), i32> {
+        debug!("Rimozione filesystem object: {} (directory: {})", path, is_directory);
+
+        let client = Client::new();
+        let url = format!("{}/remove?path={}&is_directory={}", self.api_url, path, is_directory);
+
+        match client.delete(&url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Filesystem object rimosso: {}", path);
+                Ok(())
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per rimozione: {}", path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                warn!("Permessi insufficienti per rimuovere: {}", path);
+                Err(libc::EACCES)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                warn!("Directory non vuota o file in uso: {}", path);
+                Err(libc::ENOTEMPTY)
+            }
+            Ok(resp) => {
+                error!("Errore server in rimozione per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in rimozione per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    fn open_file(&self, path: &str, flags: i32) -> Result<u64, i32> {
+        debug!("Apertura file: {} con flags: {:#x}", path, flags);
+
+        let client = Client::new();
+        let url = format!("{}/open", self.api_url);
+
+        let open_data = serde_json::json!({
+            "path": path,
+            "flags": flags
+        });
+
+        match client.post(&url).json(&open_data).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>() {
+                    Ok(response) => {
+                        if let Some(fh) = response.get("file_handle").and_then(|v| v.as_u64()) {
+                            info!("File aperto: {} -> file handle {}", path, fh);
+                            Ok(fh)
+                        } else {
+                            error!("Risposta server non valida per apertura {}: manca file_handle", path);
+                            Err(libc::EIO)
+                        }
+                    }
+                    Err(e) => {
+                        error!("Errore parsing JSON in apertura per {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per apertura: {}", path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                warn!("Permessi insufficienti per aprire: {}", path);
+                Err(libc::EACCES)
+            }
+            Ok(resp) => {
+                error!("Errore server in apertura per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in apertura per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
 }
 
 impl Filesystem for RemoteFsClient {
@@ -346,11 +482,61 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyEntry,
     ) {
         debug!(
-            "[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {}, \
-            umask: {:#x?}, rdev: {})",
+            "mknod(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, rdev: {})",
             parent, name, mode, umask, rdev
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome file non valido per mknod: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per mknod: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let file_type = match mode & libc::S_IFMT {
+            libc::S_IFREG => "RegularFile",
+            libc::S_IFDIR => "Directory", 
+            libc::S_IFLNK => "Symlink",
+            libc::S_IFBLK => "BlockDevice",
+            libc::S_IFCHR => "CharDevice",
+            libc::S_IFIFO => "NamedPipe",
+            libc::S_IFSOCK => "Socket",
+            _ => {
+                error!("Tipo di file non supportato in mknod: mode {:#o}", mode);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let permissions = mode & !libc::S_IFMT;
+        match self.create_filesystem_object(&full_path, file_type, permissions, _req.uid(), _req.gid(), rdev, umask) {
+            Ok(metadata) => {
+                let file_attr = metadata.to_file_attr();
+                reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn mkdir(
@@ -363,10 +549,48 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyEntry,
     ) {
         debug!(
-            "[Not Implemented] mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
+            "mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
             parent, name, mode, umask
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome directory non valido per mkdir: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per mkdir: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let file_type = "Directory";
+        let permissions = mode & !libc::S_IFMT;
+
+        match self.create_filesystem_object(&full_path, file_type, permissions, _req.uid(), _req.gid(), 0, umask) {
+            Ok(metadata) => {
+                let file_attr = metadata.to_file_attr();
+                reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn unlink(
@@ -377,10 +601,44 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyEmpty,
     ) {
         debug!(
-            "[Not Implemented] unlink(parent: {:#x?}, name: {:?})",
+            "unlink(parent: {:#x?}, name: {:?})",
             parent, name,
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome file non valido per unlink: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per unlink: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.remove_filesystem_object(&full_path, false) {
+            Ok(()) => {
+                reply.ok();
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn rmdir(
@@ -391,10 +649,44 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyEmpty,
     ) {
         debug!(
-            "[Not Implemented] rmdir(parent: {:#x?}, name: {:?})",
+            "rmdir(parent: {:#x?}, name: {:?})",
             parent, name,
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome directory non valido per rmdir: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per rmdir: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.remove_filesystem_object(&full_path, true) {
+            Ok(()) => {
+                reply.ok();
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn symlink(
@@ -445,8 +737,27 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::EPERM);
     }
 
-    fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        reply.opened(0, 0);
+    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        debug!("open(ino: {:#x}, flags: {:#x})", ino, flags);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x} in open", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.open_file(&path, flags) {
+            Ok(file_handle) => {
+                info!("File aperto con successo: {} -> fh {}", path, file_handle);
+                reply.opened(file_handle, 0);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn read(

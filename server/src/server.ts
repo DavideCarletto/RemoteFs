@@ -8,8 +8,7 @@ const PORT = 3000;
 
 app.use(express.json());
 
-// Mock data structure per simulare il filesystem
-interface MockFile {
+interface INode {
   ino: number;
   path: string;
   size: number;
@@ -25,8 +24,7 @@ interface MockFile {
   blksize: number;
 }
 
-// Mock filesystem con alcuni file di test
-const mockFilesystem: { [path: string]: MockFile } = {
+const fileSystem: { [path: string]: INode } = {
   "/": {
     ino: 1,
     path: "/",
@@ -91,7 +89,7 @@ const mockFilesystem: { [path: string]: MockFile } = {
 
 // Mappa inversa: inode -> path
 const inodeToPath: { [ino: number]: string } = {};
-Object.values(mockFilesystem).forEach(file => {
+Object.values(fileSystem).forEach(file => {
   inodeToPath[file.ino] = file.path;
 });
 
@@ -131,7 +129,7 @@ app.get("/metadata", (req, res) => {
     return res.status(400).json({ error: "Path richiesto" });
   }
   
-  const file = mockFilesystem[path];
+  const file = fileSystem[path];
   if (!file) {
     console.log(`❌ File non trovato: ${path}`);
     return res.status(404).json({ error: "File non trovato" });
@@ -144,21 +142,196 @@ app.get("/metadata", (req, res) => {
 // Endpoint per debug: lista tutti i file mock
 app.get("/debug/files", (req, res) => {
   res.json({
-    filesystem: mockFilesystem,
+    filesystem: fileSystem,
     inodeMap: inodeToPath
+  });
+});
+
+// Endpoint mock per creare file
+app.post("/create", (req, res) => {
+  const { path, file_type, mode, uid, gid, rdev, umask } = req.body;
+  
+  console.log(`📝 Richiesta creazione file: ${path}, tipo: ${file_type}`);
+  console.log(`   - Mode: ${mode}, UID: ${uid}, GID: ${gid}, rdev: ${rdev}, umask: ${umask}`);
+  
+  // Validazione input
+  if (!path || !file_type) {
+    console.log(`❌ Parametri mancanti: path=${path}, file_type=${file_type}`);
+    return res.status(400).json({ error: "Path e file_type sono richiesti" });
+  }
+  
+  // Controlla se il file esiste già
+  if (fileSystem[path]) {
+    console.log(`❌ File già esistente: ${path}`);
+    return res.status(409).json({ error: "File già esistente" });
+  }
+  
+  // Controlla se la directory padre esiste (semplicistico)
+  const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
+  if (parentPath !== '/' && !fileSystem[parentPath]) {
+    console.log(`❌ Directory padre non trovata: ${parentPath}`);
+    return res.status(404).json({ error: "Directory padre non trovata" });
+  }
+  
+  // Genera nuovo inode (semplice incremento)
+  const newIno = Math.max(...Object.values(fileSystem).map(f => f.ino)) + 1;
+  
+  // Determina la dimensione di default in base al tipo
+  let defaultSize = 0;
+  if (file_type === "Directory") {
+    defaultSize = 4096;
+  } else if (file_type === "RegularFile") {
+    defaultSize = 0; // File vuoto
+  }
+  
+  // Crea il nuovo file mock
+  const newFile: INode = {
+    ino: newIno,
+    path: path,
+    size: defaultSize,
+    file_type: file_type,
+    permissions: mode || 0o644,
+    nlink: file_type === "Directory" ? 2 : 1,
+    uid: uid || 1000,
+    gid: gid || 1000,
+    atime: Math.floor(Date.now() / 1000),
+    mtime: Math.floor(Date.now() / 1000),
+    ctime: Math.floor(Date.now() / 1000),
+    blocks: Math.ceil(defaultSize / 512),
+    blksize: 512
+  };
+  
+  // Aggiungi al mock filesystem
+  fileSystem[path] = newFile;
+  inodeToPath[newIno] = path;
+  
+  console.log(`✅ File creato: ${path} -> inode ${newIno}, tipo ${file_type}`);
+  
+  // Ritorna i metadati del file creato (compatibile con FileMetadata Rust)
+  res.status(201).json({
+    ino: newFile.ino,
+    size: newFile.size,
+    blocks: newFile.blocks,
+    atime: newFile.atime,
+    mtime: newFile.mtime,
+    ctime: newFile.ctime,
+    crtime: newFile.ctime, // Creation time = change time per semplicità
+    file_type: newFile.file_type,
+    permissions: newFile.permissions,
+    nlink: newFile.nlink,
+    uid: newFile.uid,
+    gid: newFile.gid,
+    blksize: newFile.blksize,
+    flags: null
+  });
+});
+
+// Endpoint mock per rimuovere file/directory
+app.delete("/remove", (req, res) => {
+  const path = req.query.path as string;
+  const isDirectory = req.query.is_directory === 'true';
+  
+  console.log(`🗑️ Richiesta rimozione: ${path} (directory: ${isDirectory})`);
+  
+  // Validazione input
+  if (!path) {
+    console.log(`❌ Path mancante nella richiesta di rimozione`);
+    return res.status(400).json({ error: "Path richiesto" });
+  }
+  
+  // Controlla se il file/directory esiste
+  const fileToRemove = fileSystem[path];
+  if (!fileToRemove) {
+    console.log(`❌ File non trovato per rimozione: ${path}`);
+    return res.status(404).json({ error: "File non trovato" });
+  }
+  
+  // Verifica coerenza tipo (directory vs file)
+  const isActuallyDirectory = fileToRemove.file_type === "Directory";
+  if (isDirectory && !isActuallyDirectory) {
+    console.log(`❌ Tentativo di rmdir su file normale: ${path}`);
+    return res.status(400).json({ error: "Non è una directory" });
+  }
+  
+  if (!isDirectory && isActuallyDirectory) {
+    console.log(`❌ Tentativo di unlink su directory: ${path}`);
+    return res.status(400).json({ error: "È una directory, usa rmdir" });
+  }
+  
+  // Se è una directory, controlla che sia vuota
+  if (isDirectory) {
+    const hasChildren = Object.keys(fileSystem).some(p => 
+      p !== path && p.startsWith(path + '/') && p.indexOf('/', path.length + 1) === -1
+    );
+    
+    if (hasChildren) {
+      console.log(`❌ Directory non vuota: ${path}`);
+      return res.status(409).json({ error: "Directory non vuota" });
+    }
+  }
+  
+  // Rimuovi dal mock filesystem
+  delete fileSystem[path];
+  delete inodeToPath[fileToRemove.ino];
+  
+  console.log(`✅ Filesystem object rimosso: ${path} (inode ${fileToRemove.ino})`);
+  
+  res.status(200).json({ message: "Rimosso con successo" });
+});
+
+// Endpoint mock per aprire file
+app.post("/open", (req, res) => {
+  const { path, flags } = req.body;
+  
+  console.log(`📂 Richiesta apertura file: ${path}, flags: ${flags}`);
+  
+  // Validazione input
+  if (!path) {
+    console.log(`❌ Path mancante nella richiesta di apertura`);
+    return res.status(400).json({ error: "Path richiesto" });
+  }
+  
+  // Controlla se il file esiste
+  const file = fileSystem[path];
+  if (!file) {
+    console.log(`❌ File non trovato per apertura: ${path}`);
+    return res.status(404).json({ error: "File non trovato" });
+  }
+  
+  // Controlla che non sia una directory (a meno che non sia opendir)
+  if (file.file_type === "Directory") {
+    console.log(`❌ Tentativo di open su directory: ${path}`);
+    return res.status(400).json({ error: "È una directory, usa opendir" });
+  }
+  
+  // Genera un file handle unico (semplice incremento basato su timestamp)
+  const fileHandle = Date.now() + Math.floor(Math.random() * 1000);
+  
+  // In un'implementazione reale, qui salveresti lo stato del file aperto
+  // Per ora simulo solo la risposta
+  
+  console.log(`✅ File aperto: ${path} -> file handle ${fileHandle}`);
+  
+  res.status(200).json({
+    file_handle: fileHandle,
+    flags: flags,
+    path: path
   });
 });
 
 
 app.listen(PORT, () => {
   console.log(`🚀 Server avviato su http://localhost:${PORT}`);
-  console.log(`📁 Mock filesystem caricato con ${Object.keys(mockFilesystem).length} file`);
+  console.log(`📁 Mock filesystem caricato con ${Object.keys(fileSystem).length} file`);
   console.log(`🔧 Endpoint disponibili:`);
   console.log(`   - GET /health - Health check`);
   console.log(`   - GET /resolve-inode/:ino - Risolve inode in path`);
   console.log(`   - GET /metadata?path=... - Ottiene metadati file`);
+  console.log(`   - POST /create - Crea nuovo file/directory`);
+  console.log(`   - POST /open - Apre un file`);
+  console.log(`   - DELETE /remove?path=...&is_directory=... - Rimuove file/directory`);
   console.log(`   - GET /debug/files - Lista tutti i file mock`);
 });
 
-export {app, mockFilesystem, inodeToPath };
+export {app, fileSystem as mockFilesystem, inodeToPath };
   
