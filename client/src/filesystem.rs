@@ -1,7 +1,8 @@
-use fuser::{FileType, Filesystem};
+use fuser::{FileAttr, FileType, Filesystem};
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use std::time::{Duration, SystemTime};
 
 const MAX_NAME_LENGTH: u32 = 255;
 
@@ -13,13 +14,37 @@ struct FileMetadata {
     atime: u64,
     mtime: u64,
     ctime: u64,
+    crtime: Option<u64>,
     file_type: FileType,
     permissions: u16,
     nlink: u32,
     uid: u32,
     gid: u32,
+    blksize: u32,
+    flags: Option<u32>,
 }
 
+impl FileMetadata {
+    fn to_file_attr(&self) -> FileAttr {
+        FileAttr {
+            ino: self.ino,
+            size: self.size,
+            blocks: self.blocks,
+            atime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.atime),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.mtime),
+            ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.ctime),
+            crtime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.crtime.unwrap_or(self.ctime)),
+            kind: self.file_type,
+            perm: self.permissions,
+            nlink: self.nlink,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: self.blksize,
+            flags: self.flags.unwrap_or(0),
+        }
+    }
+}
 
 pub struct RemoteFsClient {
     api_url: String,
@@ -33,31 +58,30 @@ impl RemoteFsClient {
     /// Risolve un inode in percorso tramite chiamata HTTP al server
     fn inode_to_path(&self, ino: u64) -> Option<String> {
         debug!("Risoluzione inode {} in percorso via HTTP", ino);
-        
+
         // Caso speciale: root directory
         if ino == 1 {
+            info!("Inode {} risolto in percorso: /", ino);
             return Some("/".to_string());
         }
 
         // Chiamata HTTP per risolvere inode -> path
         let client = Client::new();
         let url = format!("{}/resolve-inode/{}", self.api_url, ino);
-        
+
         match client.get(&url).send() {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.text() {
-                    Ok(path) => {
-                        debug!("Inode {} risolto in percorso: {}", ino, path);
-                        Some(path)
-                    }
-                    Err(e) => {
-                        error!("Errore lettura risposta per inode {}: {}", ino, e);
-                        None
-                    }
+            Ok(resp) if resp.status().is_success() => match resp.text() {
+                Ok(path) => {
+                    info!("Inode {} risolto in percorso: {}", ino, path);
+                    Some(path)
                 }
-            }
+                Err(e) => {
+                    error!("Errore lettura risposta per inode {}: {}", ino, e);
+                    None
+                }
+            },
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                debug!("Inode {} non trovato sul server", ino);
+                warn!("Inode {} non trovato sul server", ino);
                 None
             }
             Ok(resp) => {
@@ -74,7 +98,7 @@ impl RemoteFsClient {
     /// Costruisce il percorso completo da parent inode + nome
     fn build_path(&self, parent: u64, name: &str) -> Option<String> {
         let parent_path = self.inode_to_path(parent)?;
-        
+
         if parent_path == "/" {
             Some(format!("/{}", name))
         } else {
@@ -84,16 +108,46 @@ impl RemoteFsClient {
 
     /// Richiede i metadati di un file al server
     fn get_file_metadata(&self, path: &str) -> Option<FileMetadata> {
-        debug!("Richiesta metadati per: {}", path);
+        let client = Client::new();
+        let url = format!("{}/metadata?path={}", self.api_url, path);
+
+        match client.get(&url).send() {
+            Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
+                Ok(metadata) => {
+                    info!("Metadati ricevuti per {}: inode {}", path, metadata.ino);
+                    Some(metadata)
+                }
+                Err(e) => {
+                    error!("Errore parsing JSON per {}: {}", path, e);
+                    None
+                }
+            },
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato: {}", path);
+                None
+            }
+            Ok(resp) => {
+                error!("Errore server per {}: {}", path, resp.status());
+                None
+            }
+            Err(e) => {
+                error!("Errore di rete per {}: {}", path, e);
+                None
+            }
+        }
+    }
+
+    fn update_file_attributes(&self, path: &str, updates: serde_json::Value) -> Option<FileMetadata> {
+        debug!("Aggiornamento attributi per: {} con {:?}", path, updates);
         
         let client = Client::new();
         let url = format!("{}/metadata?path={}", self.api_url, path);
         
-        match client.get(&url).send() {
+        match client.patch(&url).json(&updates).send() {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<FileMetadata>() {
                     Ok(metadata) => {
-                        debug!("Metadati ricevuti per {}: inode {}", path, metadata.ino);
+                        info!("Attributi aggiornati per {}: inode {}", path, metadata.ino);
                         Some(metadata)
                     }
                     Err(e) => {
@@ -101,10 +155,6 @@ impl RemoteFsClient {
                         None
                     }
                 }
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                debug!("File non trovato: {}", path);
-                None
             }
             Ok(resp) => {
                 error!("Errore server per {}: {}", path, resp.status());
@@ -158,7 +208,7 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyEntry,
     ) {
         debug!("lookup(parent: {}, name: {:?})", parent, name);
-        
+
         if name.len() > MAX_NAME_LENGTH as usize {
             reply.error(libc::ENAMETOOLONG);
             return;
@@ -178,7 +228,10 @@ impl Filesystem for RemoteFsClient {
         let full_path = match self.build_path(parent, name_str) {
             Some(path) => path,
             None => {
-                error!("Impossibile costruire percorso per parent {} + {}", parent, name_str);
+                error!(
+                    "Impossibile costruire percorso per parent {} + {}",
+                    parent, name_str
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -187,23 +240,7 @@ impl Filesystem for RemoteFsClient {
         // Richiedi metadati al server
         match self.get_file_metadata(&full_path) {
             Some(metadata) => {
-                let file_attr = fuser::FileAttr {
-                    ino: metadata.ino,
-                    size: metadata.size,
-                    blocks: metadata.blocks,
-                    atime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(metadata.atime),
-                    mtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(metadata.mtime),
-                    ctime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(metadata.ctime),
-                    crtime: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(metadata.ctime),
-                    kind: metadata.file_type,
-                    perm: metadata.permissions,
-                    nlink: metadata.nlink,
-                    uid: metadata.uid,
-                    gid: metadata.gid,
-                    rdev: 0,
-                    flags: 0,
-                    blksize: 4096,
-                };
+                let file_attr = metadata.to_file_attr();
 
                 info!("File trovato: {} -> inode {}", full_path, metadata.ino);
                 reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
@@ -215,7 +252,7 @@ impl Filesystem for RemoteFsClient {
         }
     }
 
-    fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {}
+    fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {} //implement only if filesystem implements inode lifetimes
 
     fn getattr(
         &mut self,
@@ -224,11 +261,27 @@ impl Filesystem for RemoteFsClient {
         fh: Option<u64>,
         reply: fuser::ReplyAttr,
     ) {
-        warn!(
-            "[Not Implemented] getattr(ino: {:#x?}, fh: {:#x?})",
-            ino, fh
-        );
-        reply.error(libc::ENOSYS);
+        debug!("getattr(ino: {:#x?} )", ino);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x?}", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.get_file_metadata(&path) {
+            Some(metadata) => {
+                let file_attr = metadata.to_file_attr();
+                reply.attr(&std::time::Duration::from_secs(1), &file_attr);
+            }
+            None => {
+                warn!("File non trovato: {}", path);
+                reply.error(libc::ENOENT);
+            }
+        }
     }
 
     fn setattr(
@@ -249,12 +302,32 @@ impl Filesystem for RemoteFsClient {
         flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        debug!(
-            "[Not Implemented] setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, \
-            gid: {:?}, size: {:?}, fh: {:?}, flags: {:?})",
-            ino, mode, uid, gid, size, fh, flags
-        );
-        reply.error(libc::ENOSYS);
+        let path = match self.inode_to_path(ino){
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return
+            }
+        };
+
+        let updates = serde_json::json!({
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "size": size,
+            "flags": flags,
+        });
+        
+        match self.update_file_attributes(path.as_str(), updates.clone()) {
+            Some(metadata) => {
+                let file_attr = metadata.to_file_attr();
+                reply.attr(&std::time::Duration::from_secs(1), &file_attr);
+            }
+            None => {
+                debug!("Impossibile aggiornare attributi per {}: {}", path, updates);
+                reply.error(libc::ENOENT);
+            }
+        }
     }
 
     fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {

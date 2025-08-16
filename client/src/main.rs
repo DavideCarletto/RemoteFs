@@ -1,6 +1,6 @@
 use clap::{Arg, Command as ClapCommand};
 use fuser::MountOption;
-use log::{error, info};
+use log::{error, info, debug};
 use remote_fs::RemoteFsClient;
 use std::{fs::create_dir_all, io::ErrorKind};
 use daemonize::Daemonize;
@@ -104,7 +104,7 @@ fn main() {
 
     create_dir_all(&mountpoint).unwrap();
 
-    info!("Avvio client per mountpoint: {}", mountpoint);
+    debug!("Avvio client per mountpoint: {}", mountpoint);
     
     let client = RemoteFsClient::new("http://localhost:3000".into());
 
