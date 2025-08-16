@@ -302,6 +302,108 @@ impl RemoteFsClient {
             }
         }
     }
+
+    /// Legge dati da un file sul server tramite chiamata HTTP
+    fn read_file(&self, path: &str, file_handle: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        debug!("Lettura file: {} (fh: {}, offset: {}, size: {})", path, file_handle, offset, size);
+
+        let client = Client::new();
+        let url = format!("{}/read", self.api_url);
+
+        let read_data = serde_json::json!({
+            "path": path,
+            "file_handle": file_handle,
+            "offset": offset,
+            "size": size
+        });
+
+        match client.post(&url).json(&read_data).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.bytes() {
+                    Ok(data) => {
+                        info!("Letti {} bytes da {}", data.len(), path);
+                        Ok(data.to_vec())
+                    }
+                    Err(e) => {
+                        error!("Errore lettura risposta per {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per lettura: {}", path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST => {
+                warn!("File handle non valido per {}: {}", path, file_handle);
+                Err(libc::EBADF)
+            }
+            Ok(resp) => {
+                error!("Errore server in lettura per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in lettura per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Lista il contenuto di una directory dal server
+    fn list_directory(&self, path: &str) -> Result<Vec<(String, u64, fuser::FileType)>, i32> {
+        debug!("Lista directory: {}", path);
+
+        let client = Client::new();
+        let response = client
+            .get(&format!("{}/listdir", self.api_url))
+            .query(&[("path", path)])
+            .send();
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>() {
+                    Ok(data) => {
+                        if let Some(entries) = data.get("entries").and_then(|v| v.as_array()) {
+                            let mut result = Vec::new();
+                            
+                            for entry in entries {
+                                if let (Some(name), Some(ino), Some(file_type)) = (
+                                    entry.get("name").and_then(|v| v.as_str()),
+                                    entry.get("ino").and_then(|v| v.as_u64()),
+                                    entry.get("file_type").and_then(|v| v.as_str())
+                                ) {
+                                    let fuse_type = match file_type {
+                                        "Directory" => fuser::FileType::Directory,
+                                        "RegularFile" => fuser::FileType::RegularFile,
+                                        _ => fuser::FileType::RegularFile,
+                                    };
+                                    result.push((name.to_string(), ino, fuse_type));
+                                }
+                            }
+                            
+                            info!("Directory {} contiene {} elementi", path, result.len());
+                            Ok(result)
+                        } else {
+                            error!("Risposta server non valida per listdir {}: manca entries", path);
+                            Err(libc::ENOENT)
+                        }
+                    }
+                    Err(e) => {
+                        error!("Errore parsing JSON per listdir {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                }
+            }
+            Ok(resp) => {
+                error!("Errore server in listdir per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in listdir per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
 }
 
 impl Filesystem for RemoteFsClient {
@@ -751,7 +853,6 @@ impl Filesystem for RemoteFsClient {
 
         match self.open_file(&path, flags) {
             Ok(file_handle) => {
-                info!("File aperto con successo: {} -> fh {}", path, file_handle);
                 reply.opened(file_handle, 0);
             }
             Err(error_code) => {
@@ -771,12 +872,28 @@ impl Filesystem for RemoteFsClient {
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        warn!(
-            "[Not Implemented] read(ino: {:#x?}, fh: {}, offset: {}, size: {}, \
-            flags: {:#x?}, lock_owner: {:?})",
+        debug!(
+            "read(ino: {:#x}, fh: {}, offset: {}, size: {}, flags: {:#x}, lock_owner: {:?})",
             ino, fh, offset, size, flags, lock_owner
         );
-        reply.error(libc::ENOSYS);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x} in read", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.read_file(&path, fh, offset, size) {
+            Ok(data) => {
+                reply.data(&data);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn write(
@@ -864,13 +981,44 @@ impl Filesystem for RemoteFsClient {
         ino: u64,
         fh: u64,
         offset: i64,
-        reply: fuser::ReplyDirectory,
+        mut reply: fuser::ReplyDirectory,
     ) {
-        warn!(
-            "[Not Implemented] readdir(ino: {:#x?}, fh: {}, offset: {})",
-            ino, fh, offset
-        );
-        reply.error(libc::ENOSYS);
+        debug!("readdir(ino: {:#x}, fh: {}, offset: {})", ino, fh, offset);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x} in readdir", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let entries = match self.list_directory(&path) {
+            Ok(entries) => entries,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
+        let mut full_entries = vec![
+            (".".to_string(), ino, fuser::FileType::Directory),
+            ("..".to_string(), 1, fuser::FileType::Directory),
+        ];
+
+        for (name, entry_ino, file_type) in entries {
+            full_entries.push((name, entry_ino, file_type));
+        }
+
+        for (i, (name, entry_ino, file_type)) in full_entries.iter().enumerate().skip(offset as usize) {
+            if reply.add(*entry_ino, (i + 1) as i64, *file_type, name.as_str()) {
+                break;
+            }
+        }
+
+        info!("Readdir completato per {}: {} entries", path, full_entries.len());
+        reply.ok();
     }
 
     fn readdirplus(

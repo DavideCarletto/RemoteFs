@@ -43,7 +43,7 @@ const fileSystem: { [path: string]: INode } = {
   "/test.txt": {
     ino: 2,
     path: "/test.txt",
-    size: 12,
+    size: 70,
     file_type: "RegularFile",
     permissions: 0o644,
     nlink: 1,
@@ -319,6 +319,94 @@ app.post("/open", (req, res) => {
   });
 });
 
+// Read file content endpoint  
+app.post('/read', (req, res) => {
+  console.log('[READ] Received request:', JSON.stringify(req.body, null, 2));
+  
+  const { path, file_handle, offset, size } = req.body;
+
+  if (!path || file_handle === undefined) {
+    console.error('[READ] Missing required parameters:', { path, file_handle });
+    return res.status(400).json({ error: 'Path and file handle are required' });
+  }
+
+  const node = fileSystem[path];
+  if (!node) {
+    console.error('[READ] File not found:', path);
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  if (node.file_type !== 'RegularFile') {
+    console.error('[READ] Cannot read non-regular file:', path, 'type:', node.file_type);
+    return res.status(400).json({ error: 'Cannot read directory or special file' });
+  }
+
+  const fileContent = Buffer.from(`Content of file: ${path}\nThis is line 2\nThis is line 3\nEnd of file.\n`);
+  
+  const startOffset = Math.max(0, offset);
+  const endOffset = Math.min(fileContent.length, startOffset + size);
+  const data = fileContent.slice(startOffset, endOffset);
+
+  console.log(`[READ] Reading ${data.length} bytes from ${path} (offset: ${offset}, size: ${size})`);
+  
+  res.set('Content-Type', 'application/octet-stream');
+  res.send(data);
+});
+
+// List directory content endpoint
+app.get('/listdir', (req, res) => {
+  console.log('[LISTDIR] Received request:', req.query);
+  
+  const path = req.query.path as string;
+
+  if (!path) {
+    console.error('[LISTDIR] Missing path parameter');
+    return res.status(400).json({ error: 'Path parameter is required' });
+  }
+
+  const node = fileSystem[path];
+  if (!node) {
+    console.error('[LISTDIR] Directory not found:', path);
+    return res.status(404).json({ error: 'Directory not found' });
+  }
+
+  if (node.file_type !== 'Directory') {
+    console.error('[LISTDIR] Path is not a directory:', path, 'type:', node.file_type);
+    return res.status(400).json({ error: 'Path is not a directory' });
+  }
+
+  const entries = [];
+  const searchPrefix = path === '/' ? '/' : path + '/';
+  
+  for (const [childPath, childNode] of Object.entries(fileSystem)) {
+    if (childPath === path) continue;
+    
+    if (path === '/') {
+      if (childPath.startsWith('/') && childPath !== '/' && !childPath.slice(1).includes('/')) {
+        entries.push({
+          name: childPath.slice(1),
+          ino: childNode.ino,
+          file_type: childNode.file_type
+        });
+      }
+    } else {
+      if (childPath.startsWith(searchPrefix)) {
+        const relativePath = childPath.slice(searchPrefix.length);
+        if (!relativePath.includes('/')) {
+          entries.push({
+            name: relativePath,
+            ino: childNode.ino,
+            file_type: childNode.file_type
+          });
+        }
+      }
+    }
+  }
+
+  console.log(`[LISTDIR] Directory ${path} contains ${entries.length} entries`);
+  
+  res.json({ entries });
+});
 
 app.listen(PORT, () => {
   console.log(`🚀 Server avviato su http://localhost:${PORT}`);
@@ -329,6 +417,8 @@ app.listen(PORT, () => {
   console.log(`   - GET /metadata?path=... - Ottiene metadati file`);
   console.log(`   - POST /create - Crea nuovo file/directory`);
   console.log(`   - POST /open - Apre un file`);
+  console.log(`   - POST /read - Legge contenuto file`);
+  console.log(`   - GET /listdir?path=... - Lista contenuto directory`);
   console.log(`   - DELETE /remove?path=...&is_directory=... - Rimuove file/directory`);
   console.log(`   - GET /debug/files - Lista tutti i file mock`);
 });
