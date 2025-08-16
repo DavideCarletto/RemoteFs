@@ -139,6 +139,44 @@ app.get("/metadata", (req, res) => {
   res.json(file);
 });
 
+// Endpoint per aggiornare metadati di un file
+app.patch("/metadata", (req, res) => {
+  console.log('[PATCH METADATA] Received request:', JSON.stringify(req.body, null, 2));
+  
+  const path = req.query.path as string;
+  if (!path) {
+    console.error('[PATCH METADATA] Missing path parameter');
+    return res.status(400).json({ error: "Path parameter is required" });
+  }
+
+  const file = fileSystem[path];
+  if (!file) {
+    console.error(`[PATCH METADATA] File not found: ${path}`);
+    return res.status(404).json({ error: "File not found" });
+  }
+
+  // Update the provided fields
+  const updates = req.body;
+  if (updates.mode !== undefined && updates.mode !== null) {
+    file.permissions = updates.mode;
+  }
+  if (updates.uid !== undefined && updates.uid !== null) {
+    file.uid = updates.uid;
+  }
+  if (updates.gid !== undefined && updates.gid !== null) {
+    file.gid = updates.gid;
+  }
+  if (updates.size !== undefined && updates.size !== null) {
+    file.size = updates.size;
+  }
+
+  // Always update mtime when attributes change
+  file.mtime = Math.floor(Date.now() / 1000);
+
+  console.log(`[PATCH METADATA] Updated metadata for: ${path}`);
+  res.json(file);
+});
+
 // Endpoint per debug: lista tutti i file mock
 app.get("/debug/files", (req, res) => {
   res.json({
