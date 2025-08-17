@@ -1,39 +1,669 @@
-use fuser::Filesystem;
-use log::{warn, debug};
+use fuser::{FileAttr, FileType, Filesystem};
+use log::{debug, error, info, warn};
+use reqwest::blocking::Client;
+use serde::Deserialize;
+use std::time::{Duration, SystemTime};
+
+//per caching
+#[cfg(feature = "cache")]
+use crate::cache::FileSystemCache;
+#[cfg(feature = "cache")]
+use std::sync::{Arc,Mutex};
+#[cfg(feature = "cache")]
+use std::thread;
+
+const MAX_NAME_LENGTH: u32 = 255;
+
+#[derive(Deserialize, Clone)]
+pub struct FileMetadata {
+    pub ino: u64,
+    pub size: u64,
+    pub blocks: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
+    pub crtime: Option<u64>,
+    pub file_type: FileType,
+    pub permissions: u16,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub blksize: u32,
+    pub flags: Option<u32>,
+}
+
+impl FileMetadata {
+    fn to_file_attr(&self) -> FileAttr {
+        FileAttr {
+            ino: self.ino,
+            size: self.size,
+            blocks: self.blocks,
+            atime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.atime),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.mtime),
+            ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.ctime),
+            crtime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.crtime.unwrap_or(self.ctime)),
+            kind: self.file_type,
+            perm: self.permissions,
+            nlink: self.nlink,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: self.blksize,
+            flags: self.flags.unwrap_or(0),
+        }
+    }
+}
 
 pub struct RemoteFsClient {
-    api_url: String
+    api_url: String,
+    #[cfg(feature = "cache")]
+    cache: Arc<Mutex<FileSystemCache>>,
 }
 
 impl RemoteFsClient {
     pub fn new(api_url: String) -> Self {
-        Self { api_url }
+        #[cfg(feature = "cache")]{
+             let cache = Arc::new(Mutex::new(FileSystemCache::with_default()));
+            let client = Self{
+                api_url,
+                cache: cache.clone(),
+            };
+
+            client.start_cache_cleanup_thread();
+
+            client
+        }
+        #[cfg(not(feature = "cache"))]{
+            Self {api_url}
+        }
+       
+    }
+
+    #[cfg(feature = "cache")]
+    fn start_cache_cleanup_thread(&self){
+        let cache = Arc::clone(&self.cache);
+        thread::spawn(move ||{
+            loop{
+                //cleanup ogni minuto
+                thread::sleep(Duration::from_secs(60));
+                if let Ok(mut cache) = cache.lock(){
+                    cache.cleanup_expired();
+                }
+            }
+        });
+    }
+
+    /// Risolve un inode in percorso tramite chiamata HTTP al server
+    fn inode_to_path(&self, ino: u64) -> Option<String> {
+        debug!("Risoluzione inode {} in percorso via HTTP", ino);
+
+        // Caso speciale: root directory
+        if ino == 1 {
+            info!("Inode {} risolto in percorso: /", ino);
+            return Some("/".to_string());
+        }
+
+        //controlla cache prima
+        #[cfg(feature = "cache")]
+        if let Ok(mut cache) = self.cache.lock(){
+            if let Some(path) = cache.get_path_by_inode(ino){
+                return Some(path);
+            }
+        }
+
+        //cache miss o senza cache: chiamata HTTP
+        let client = Client::new();
+        let url = format!("{}/resolve-inode/{}", self.api_url, ino);
+
+        match client.get(&url).send() {
+            Ok(resp) if resp.status().is_success() => match resp.text() {
+                Ok(path) => {
+                    info!("Inode {} risolto in percorso: {}", ino, path);
+
+                    //salva in cache solo se abilitata
+                    #[cfg(feature = "cache")]
+                    if let Ok(mut cache) = self.cache.lock(){
+                        cache.cache_inode_path_mapping(ino,path.clone());
+                    }
+
+                    Some(path)
+                }
+                Err(e) => {
+                    error!("Errore lettura risposta per inode {}: {}", ino, e);
+                    None
+                }
+            },
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("Inode {} non trovato sul server", ino);
+                None
+            }
+            Ok(resp) => {
+                error!("Errore server per inode {}: {}", ino, resp.status());
+                None
+            }
+            Err(e) => {
+                error!("Errore di rete per inode {}: {}", ino, e);
+                None
+            }
+        }
+    }
+
+    /// Costruisce il percorso completo da parent inode + nome
+    fn build_path(&self, parent: u64, name: &str) -> Option<String> {
+        let parent_path = self.inode_to_path(parent)?;
+
+        if parent_path == "/" {
+            Some(format!("/{}", name))
+        } else {
+            Some(format!("{}/{}", parent_path, name))
+        }
+    }
+
+    /// Richiede i metadati di un file con cache
+    fn get_file_metadata(&self, path: &str) -> Option<FileMetadata> {
+        //controlla cache prima
+        #[cfg(feature = "cache")]
+        if let Ok(mut cache) = self.cache.lock(){
+            if let Some(metadata) = cache.get_metadata_by_path(path){
+                return Some(metadata);
+            }
+        }
+
+        //cache miss o senza cache: chiamata HTTP
+        debug!("Richiesta metadati per {} via HTTP", path);
+        let client = Client::new();
+        let url = format!("{}/metadata?path={}", self.api_url, path);
+
+        match client.get(&url).send() {
+            Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
+                Ok(metadata) => {
+                    info!("Metadati ricevuti per {}: inode {}", path, metadata.ino);
+
+                    //salva in cache solo se abilitata
+                    #[cfg(feature = "cache")]
+                    if let Ok(mut cache) = self.cache.lock(){
+                        cache.cache_metadata(path.to_string(),metadata.clone());
+                    }
+
+                    Some(metadata)
+                }
+                Err(e) => {
+                    error!("Errore parsing JSON per {}: {}", path, e);
+                    None
+                }
+            },
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato: {}", path);
+                None
+            }
+            Ok(resp) => {
+                error!("Errore server per {}: {}", path, resp.status());
+                None
+            }
+            Err(e) => {
+                error!("Errore di rete per {}: {}", path, e);
+                None
+            }
+        }
+    }
+
+    fn update_file_attributes(&self, path: &str, updates: serde_json::Value) -> Option<FileMetadata> {
+        debug!("Aggiornamento attributi per: {} con {:?}", path, updates);
+        
+        let client = Client::new();
+        let url = format!("{}/metadata?path={}", self.api_url, path);
+        
+        match client.patch(&url).json(&updates).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<FileMetadata>() {
+                    Ok(metadata) => {
+                        info!("Attributi aggiornati per {}: inode {}", path, metadata.ino);
+                        Some(metadata)
+                    }
+                    Err(e) => {
+                        error!("Errore parsing JSON per {}: {}", path, e);
+                        None
+                    }
+                }
+            }
+            Ok(resp) => {
+                error!("Errore server per {}: {}", path, resp.status());
+                None
+            }
+            Err(e) => {
+                error!("Errore di rete per {}: {}", path, e);
+                None
+            }
+        }
+    }
+
+    /// Crea un nuovo filesystem object (file, directory, etc.) sul server tramite chiamata HTTP
+    fn create_filesystem_object(&self, path: &str, file_type: &str, mode: u32, uid: u32, gid: u32, rdev: u32, umask: u32) -> Result<FileMetadata, i32> {
+        debug!("Creazione filesystem object: {} tipo: {}", path, file_type);
+        
+        let create_data = serde_json::json!({
+            "path": path,
+            "file_type": file_type,
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "rdev": rdev,
+            "umask": umask
+        });
+
+        let client = Client::new();
+        let url = format!("{}/create", self.api_url);
+
+        match client.post(&url).json(&create_data).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<FileMetadata>() {
+                    Ok(metadata) => {
+                        info!("File creato: {} -> inode {}", path, metadata.ino);
+                        Ok(metadata)
+                    }
+                    Err(e) => {
+                        error!("Errore parsing JSON in creazione per {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                warn!("File già esistente: {}", path);
+                Err(libc::EEXIST)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("Directory padre non trovata per: {}", path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                warn!("Permessi insufficienti per creare: {}", path);
+                Err(libc::EACCES)
+            }
+            Ok(resp) => {
+                error!("Errore server in creazione per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in creazione per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Rimuove un filesystem object (file, directory, etc.) dal server tramite chiamata HTTP
+    fn remove_filesystem_object(&self, path: &str, is_directory: bool) -> Result<(), i32> {
+        debug!("Rimozione filesystem object: {} (directory: {})", path, is_directory);
+
+        let client = Client::new();
+        let url = format!("{}/remove?path={}&is_directory={}", self.api_url, path, is_directory);
+
+        match client.delete(&url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Filesystem object rimosso: {}", path);
+                Ok(())
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per rimozione: {}", path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                warn!("Permessi insufficienti per rimuovere: {}", path);
+                Err(libc::EACCES)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                warn!("Directory non vuota o file in uso: {}", path);
+                Err(libc::ENOTEMPTY)
+            }
+            Ok(resp) => {
+                error!("Errore server in rimozione per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in rimozione per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    fn open_file(&self, path: &str, flags: i32) -> Result<u64, i32> {
+        debug!("Apertura file: {} con flags: {:#x}", path, flags);
+
+        let client = Client::new();
+        let url = format!("{}/open", self.api_url);
+
+        let open_data = serde_json::json!({
+            "path": path,
+            "flags": flags
+        });
+
+        match client.post(&url).json(&open_data).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>() {
+                    Ok(response) => {
+                        if let Some(fh) = response.get("file_handle").and_then(|v| v.as_u64()) {
+                            info!("File aperto: {} -> file handle {}", path, fh);
+                            Ok(fh)
+                        } else {
+                            error!("Risposta server non valida per apertura {}: manca file_handle", path);
+                            Err(libc::EIO)
+                        }
+                    }
+                    Err(e) => {
+                        error!("Errore parsing JSON in apertura per {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per apertura: {}", path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                warn!("Permessi insufficienti per aprire: {}", path);
+                Err(libc::EACCES)
+            }
+            Ok(resp) => {
+                error!("Errore server in apertura per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in apertura per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Legge dati da un file con cache per file piccoli 
+    fn read_file(&self, path: &str, file_handle: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        //per file piccoli e offset 0, controlla cache
+        #[cfg(feature = "cache")]
+        if offset == 0 && size <= 1024*1024{
+            if let Some(metadata) = self.get_file_metadata(path){
+                if let Ok(mut cache) = self.cache.lock(){
+                    if let Some(cached_data) = cache.get_file_content(path, metadata.size){
+                        let end = (size as usize).min(cached_data.len());
+                        return Ok(cached_data[..end].to_vec());
+                    }
+                }
+            }
+        }
+
+        //cache miss o file grandi o cache disabilitata: chiamata HTTP
+        debug!("Lettura file: {} (fh: {}, offset: {}, size: {})", path, file_handle, offset, size);
+
+        let client = Client::new();
+        let url = format!("{}/read", self.api_url);
+
+        let read_data = serde_json::json!({
+            "path": path,
+            "file_handle": file_handle,
+            "offset": offset,
+            "size": size
+        });
+
+        match client.post(&url).json(&read_data).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.bytes() {
+                    Ok(data) => {
+                        let data_vec = data.to_vec();
+                        info!("Letti {} bytes da {}", data.len(), path);
+                        
+                        //se è un file completo piccolo, cacha solo se cache abilitata
+                        #[cfg(feature = "cache")]
+                        if offset == 0 && data_vec.len() <= 1024 * 1024 {
+                            if let Ok(mut cache) = self.cache.lock(){
+                                cache.cache_file_content(path.to_string(), data_vec.clone(), data_vec.len() as u64);
+                            }
+                        }
+
+                        Ok(data_vec)
+                    }
+                    Err(e) => {
+                        error!("Errore lettura risposta per {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per lettura: {}", path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST => {
+                warn!("File handle non valido per {}: {}", path, file_handle);
+                Err(libc::EBADF)
+            }
+            Ok(resp) => {
+                error!("Errore server in lettura per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in lettura per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Lista il contenuto di una directory con cache
+    fn list_directory(&self, path: &str) -> Result<Vec<(String, u64, fuser::FileType)>, i32> {
+        //controlla cache prima
+        #[cfg(feature = "cache")]
+        if let Ok(mut cache) = self.cache.lock(){
+            if let Some(entries) = cache.get_directory_entries(path){
+                let result: Vec<(String, u64, fuser::FileType)> = entries.into_iter()
+                    .map(|entry| (entry.name, entry.ino,entry.file_type))
+                    .collect();
+                return Ok(result);
+            }
+        }
+        
+        //cache miss o cache disabilitata: chiamata HTTP
+        debug!("Lista directory: {}", path);
+
+        let client = Client::new();
+        let response = client
+            .get(&format!("{}/listdir", self.api_url))
+            .query(&[("path", path)])
+            .send();
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>() {
+                    Ok(data) => {
+                        if let Some(entries) = data.get("entries").and_then(|v| v.as_array()) {
+                            let mut result = Vec::new();
+                            
+                            for entry in entries {
+                                if let (Some(name), Some(ino), Some(file_type)) = (
+                                    entry.get("name").and_then(|v| v.as_str()),
+                                    entry.get("ino").and_then(|v| v.as_u64()),
+                                    entry.get("file_type").and_then(|v| v.as_str())
+                                ) {
+                                    let fuse_type = match file_type {
+                                        "Directory" => fuser::FileType::Directory,
+                                        "RegularFile" => fuser::FileType::RegularFile,
+                                        _ => fuser::FileType::RegularFile,
+                                    };
+                                    result.push((name.to_string(), ino, fuse_type));
+                                }
+                            }
+                            
+                            info!("Directory {} contiene {} elementi", path, result.len());
+
+                            //salva in cache solo se abilitata
+                            #[cfg(feature = "cache")]
+                            if let Ok(mut cache) = self.cache.lock(){
+                                cache.cache_directory_entries(path.to_string(), result.clone());
+                            }
+
+                            Ok(result)
+                        } else {
+                            error!("Risposta server non valida per listdir {}: manca entries", path);
+                            Err(libc::ENOENT)
+                        }
+                    }
+                    Err(e) => {
+                        error!("Errore parsing JSON per listdir {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                }
+            }
+            Ok(resp) => {
+                error!("Errore server in listdir per {}: {}", path, resp.status());
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in listdir per {}: {}", path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    //invalidazione cache dopo operazioni che modificano il filesytem
+    #[cfg(feature = "cache")]
+    fn invalidate_cache_for_path(&self,path: &str){
+        if let Ok(mut cache) = self.cache.lock(){
+            cache.invalidate_path(path);
+        }
+    }
+
+    #[cfg(not(feature = "cache"))]
+    fn invalidate_cache_for_path(&self, _path: &str){
+        // Non fare nulla se cache disabilitata
+    }
+
+    #[cfg(feature = "cache")]
+    fn invalidate_cache_for_directory(&self, dir_path: &str){
+        if let Ok(mut cache) = self.cache.lock(){
+            cache.invalidate_directory(dir_path);
+        }
+    }
+
+    #[cfg(not(feature = "cache"))]
+    fn invalidate_cache_for_directory(&self, _dir_path: &str){
+        // Non fare nulla se cache disabilitata
     }
 }
 
 impl Filesystem for RemoteFsClient {
-    fn init(&mut self, _req: &fuser::Request<'_>, _config: &mut fuser::KernelConfig) -> Result<(), libc::c_int> {
-        Ok(())
+    fn init(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        let health_url = format!("{}/health", self.api_url);
+        let client = Client::new();
+        match client.get(&health_url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                config.set_max_readahead(128 * 1024).ok();
+                config.set_max_write(128 * 1024).ok();
+                info!("Remote FS client initialized successfully.");
+                Ok(())
+            }
+            _ => {
+                error!(
+                    "Errore: impossibile raggiungere il server API all'URL {}",
+                    health_url
+                );
+                Err(libc::EIO)
+            }
+        }
+    }
+    fn destroy(&mut self) {
+        //stampa statistiche cache prima di distruggere
+        #[cfg(feature = "cache")]
+        if let Ok(cache) = self.cache.lock() {
+            cache.print_stats();
+        }
+        
+        info!("Filesystem remoto smontato e distrutto");
+        // Puoi aggiungere cleanup qui se necessario:
+        // - Chiudere connessioni HTTP persistenti
+        // - Salvare cache o stato
+        // - Log di chiusura
     }
 
-    fn destroy(&mut self) {}
+    fn lookup(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
+        debug!("lookup(parent: {}, name: {:?})", parent, name);
 
-    fn lookup(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEntry) {
-        warn!(
-            "[Not Implemented] lookup(parent: {:#x?}, name {:?})",
-            parent, name
-        );
-        reply.error(libc::ENOSYS);
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        // Converti OsStr in String
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome file non valido: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        // Costruisci il percorso completo
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Richiedi metadati al server
+        match self.get_file_metadata(&full_path) {
+            Some(metadata) => {
+                let file_attr = metadata.to_file_attr();
+
+                info!("File trovato: {} -> inode {}", full_path, metadata.ino);
+                reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
+            }
+            None => {
+                debug!("File non trovato: {}", full_path);
+                reply.error(libc::ENOENT);
+            }
+        }
     }
 
-    fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {}
+    fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {} //implement only if filesystem implements inode lifetimes
 
-    fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: Option<u64>, reply: fuser::ReplyAttr) {
-        warn!(
-            "[Not Implemented] getattr(ino: {:#x?}, fh: {:#x?})",
-            ino, fh
-        );
-        reply.error(libc::ENOSYS);
+    fn getattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        _fh: Option<u64>,
+        reply: fuser::ReplyAttr,
+    ) {
+        debug!("getattr(ino: {:#x?} )", ino);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x?}", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.get_file_metadata(&path) {
+            Some(metadata) => {
+                let file_attr = metadata.to_file_attr();
+                reply.attr(&std::time::Duration::from_secs(1), &file_attr);
+            }
+            None => {
+                warn!("File non trovato: {}", path);
+                reply.error(libc::ENOENT);
+            }
+        }
     }
 
     fn setattr(
@@ -47,19 +677,43 @@ impl Filesystem for RemoteFsClient {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        fh: Option<u64>,
+        _fh: Option<u64>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
         flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        debug!(
-            "[Not Implemented] setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, \
-            gid: {:?}, size: {:?}, fh: {:?}, flags: {:?})",
-            ino, mode, uid, gid, size, fh, flags
-        );
-        reply.error(libc::ENOSYS);
+        let path = match self.inode_to_path(ino){
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return
+            }
+        };
+
+        let updates = serde_json::json!({
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "size": size,
+            "flags": flags,
+        });
+        
+        match self.update_file_attributes(path.as_str(), updates.clone()) {
+            Some(metadata) => {
+                let file_attr = metadata.to_file_attr();
+                
+                // Invalida cache per il file modificato
+                self.invalidate_cache_for_path(&path);
+                
+                reply.attr(&std::time::Duration::from_secs(1), &file_attr);
+            }
+            None => {
+                debug!("Impossibile aggiornare attributi per {}: {}", path, updates);
+                reply.error(libc::ENOENT);
+            }
+        }
     }
 
     fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
@@ -78,11 +732,66 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyEntry,
     ) {
         debug!(
-            "[Not Implemented] mknod(parent: {:#x?}, name: {:?}, mode: {}, \
-            umask: {:#x?}, rdev: {})",
+            "mknod(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, rdev: {})",
             parent, name, mode, umask, rdev
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome file non valido per mknod: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per mknod: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let file_type = match mode & libc::S_IFMT {
+            libc::S_IFREG => "RegularFile",
+            libc::S_IFDIR => "Directory", 
+            libc::S_IFLNK => "Symlink",
+            libc::S_IFBLK => "BlockDevice",
+            libc::S_IFCHR => "CharDevice",
+            libc::S_IFIFO => "NamedPipe",
+            libc::S_IFSOCK => "Socket",
+            _ => {
+                error!("Tipo di file non supportato in mknod: mode {:#o}", mode);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let permissions = mode & !libc::S_IFMT;
+        match self.create_filesystem_object(&full_path, file_type, permissions, _req.uid(), _req.gid(), rdev, umask) {
+            Ok(metadata) => {
+                let file_attr = metadata.to_file_attr();
+
+                //invalida cache directory padre
+                if let Some(parent_path) = self.inode_to_path(parent){
+                    self.invalidate_cache_for_directory(&parent_path);
+                } 
+                reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn mkdir(
@@ -95,26 +804,160 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyEntry,
     ) {
         debug!(
-            "[Not Implemented] mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
+            "mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
             parent, name, mode, umask
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome directory non valido per mkdir: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per mkdir: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let file_type = "Directory";
+        let permissions = mode & !libc::S_IFMT;
+
+        match self.create_filesystem_object(&full_path, file_type, permissions, _req.uid(), _req.gid(), 0, umask) {
+            Ok(metadata) => {
+                let file_attr = metadata.to_file_attr();
+                
+                // Invalida cache directory padre
+                if let Some(parent_path) = self.inode_to_path(parent) {
+                    self.invalidate_cache_for_directory(&parent_path);
+                }
+                
+                reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
-    fn unlink(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
+    fn unlink(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
-            "[Not Implemented] unlink(parent: {:#x?}, name: {:?})",
+            "unlink(parent: {:#x?}, name: {:?})",
             parent, name,
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome file non valido per unlink: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per unlink: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.remove_filesystem_object(&full_path, false) {
+            Ok(()) => {
+                self.invalidate_cache_for_path(&full_path);
+                if let Some(parent_path) = self.inode_to_path(parent) {
+                    self.invalidate_cache_for_directory(&parent_path);
+                }
+                reply.ok();
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
-    fn rmdir(&mut self, _req: &fuser::Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
+    fn rmdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
-            "[Not Implemented] rmdir(parent: {:#x?}, name: {:?})",
+            "rmdir(parent: {:#x?}, name: {:?})",
             parent, name,
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome directory non valido per rmdir: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per rmdir: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.remove_filesystem_object(&full_path, true) {
+            Ok(()) => {
+                // Invalida cache per directory rimossa e directory padre
+                self.invalidate_cache_for_path(&full_path);
+                if let Some(parent_path) = self.inode_to_path(parent) {
+                    self.invalidate_cache_for_directory(&parent_path);
+                }
+                
+                reply.ok();
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn symlink(
@@ -129,6 +972,15 @@ impl Filesystem for RemoteFsClient {
             "[Not Implemented] symlink(parent: {:#x?}, link_name: {:?}, target: {:?})",
             parent, link_name, target,
         );
+        
+        // TODO: Quando implementato, aggiungere:
+        // let full_path = self.build_path(parent, link_name.to_str().unwrap()).unwrap();
+        // // ... logica di creazione symlink ...
+        // // Invalida cache directory padre
+        // if let Some(parent_path) = self.inode_to_path(parent) {
+        //     self.invalidate_cache_for_directory(&parent_path);
+        // }
+        
         reply.error(libc::EPERM);
     }
 
@@ -147,6 +999,23 @@ impl Filesystem for RemoteFsClient {
             newname: {:?}, flags: {})",
             parent, name, newparent, newname, flags,
         );
+        
+        // TODO: Quando implementato, aggiungere:
+        // let old_path = self.build_path(parent, name.to_str().unwrap()).unwrap();
+        // let new_path = self.build_path(newparent, newname.to_str().unwrap()).unwrap();
+        // // ... logica di rename ...
+        // // Invalida cache per entrambi i percorsi e le directory coinvolte
+        // self.invalidate_cache_for_path(&old_path);
+        // self.invalidate_cache_for_path(&new_path);
+        // if let Some(old_parent_path) = self.inode_to_path(parent) {
+        //     self.invalidate_cache_for_directory(&old_parent_path);
+        // }
+        // if parent != newparent {
+        //     if let Some(new_parent_path) = self.inode_to_path(newparent) {
+        //         self.invalidate_cache_for_directory(&new_parent_path);
+        //     }
+        // }
+        
         reply.error(libc::ENOSYS);
     }
 
@@ -162,11 +1031,40 @@ impl Filesystem for RemoteFsClient {
             "[Not Implemented] link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
             ino, newparent, newname
         );
+        
+        // TODO: Quando implementato, aggiungere:
+        // let new_path = self.build_path(newparent, newname.to_str().unwrap()).unwrap();
+        // let old_path = self.inode_to_path(ino).unwrap();
+        // // ... logica di creazione hard link ...
+        // // Invalida cache per file originale (cambia nlink) e directory padre del nuovo link
+        // self.invalidate_cache_for_path(&old_path);
+        // if let Some(parent_path) = self.inode_to_path(newparent) {
+        //     self.invalidate_cache_for_directory(&parent_path);
+        // }
+        
         reply.error(libc::EPERM);
     }
 
-    fn open(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        reply.opened(0, 0);
+    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        debug!("open(ino: {:#x}, flags: {:#x})", ino, flags);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x} in open", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.open_file(&path, flags) {
+            Ok(file_handle) => {
+                reply.opened(file_handle, 0);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn read(
@@ -180,12 +1078,28 @@ impl Filesystem for RemoteFsClient {
         lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        warn!(
-            "[Not Implemented] read(ino: {:#x?}, fh: {}, offset: {}, size: {}, \
-            flags: {:#x?}, lock_owner: {:?})",
+        debug!(
+            "read(ino: {:#x}, fh: {}, offset: {}, size: {}, flags: {:#x}, lock_owner: {:?})",
             ino, fh, offset, size, flags, lock_owner
         );
-        reply.error(libc::ENOSYS);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x} in read", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.read_file(&path, fh, offset, size) {
+            Ok(data) => {
+                reply.data(&data);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn write(
@@ -211,10 +1125,24 @@ impl Filesystem for RemoteFsClient {
             flags,
             lock_owner
         );
+        
+        // TODO: Quando implementato, aggiungere:
+        // let path = self.inode_to_path(ino).unwrap();
+        // // ... logica di scrittura ...
+        // // Invalida cache per file modificato
+        // self.invalidate_cache_for_path(&path);
+        
         reply.error(libc::ENOSYS);
     }
 
-    fn flush(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: fuser::ReplyEmpty) {
+    fn flush(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: u64,
+        lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
             "[Not Implemented] flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
             ino, fh, lock_owner
@@ -235,7 +1163,14 @@ impl Filesystem for RemoteFsClient {
         reply.ok();
     }
 
-    fn fsync(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, datasync: bool, reply: fuser::ReplyEmpty) {
+    fn fsync(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
             "[Not Implemented] fsync(ino: {:#x?}, fh: {}, datasync: {})",
             ino, fh, datasync
@@ -243,7 +1178,13 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn opendir(&mut self, _req: &fuser::Request<'_>, _ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+    fn opendir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _flags: i32,
+        reply: fuser::ReplyOpen,
+    ) {
         reply.opened(0, 0);
     }
 
@@ -253,13 +1194,44 @@ impl Filesystem for RemoteFsClient {
         ino: u64,
         fh: u64,
         offset: i64,
-        reply: fuser::ReplyDirectory,
+        mut reply: fuser::ReplyDirectory,
     ) {
-        warn!(
-            "[Not Implemented] readdir(ino: {:#x?}, fh: {}, offset: {})",
-            ino, fh, offset
-        );
-        reply.error(libc::ENOSYS);
+        debug!("readdir(ino: {:#x}, fh: {}, offset: {})", ino, fh, offset);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x} in readdir", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let entries = match self.list_directory(&path) {
+            Ok(entries) => entries,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
+        let mut full_entries = vec![
+            (".".to_string(), ino, fuser::FileType::Directory),
+            ("..".to_string(), 1, fuser::FileType::Directory),
+        ];
+
+        for (name, entry_ino, file_type) in entries {
+            full_entries.push((name, entry_ino, file_type));
+        }
+
+        for (i, (name, entry_ino, file_type)) in full_entries.iter().enumerate().skip(offset as usize) {
+            if reply.add(*entry_ino, (i + 1) as i64, *file_type, name.as_str()) {
+                break;
+            }
+        }
+
+        info!("Readdir completato per {}: {} entries", path, full_entries.len());
+        reply.ok();
     }
 
     fn readdirplus(
@@ -321,6 +1293,13 @@ impl Filesystem for RemoteFsClient {
             "[Not Implemented] setxattr(ino: {:#x?}, name: {:?}, flags: {:#x?}, position: {})",
             ino, name, flags, position
         );
+        
+        // TODO: Quando implementato, aggiungere:
+        // let path = self.inode_to_path(ino).unwrap();
+        // // ... logica di impostazione xattr ...
+        // // Invalida cache per file modificato (metadati extended attributes)
+        // self.invalidate_cache_for_path(&path);
+        
         reply.error(libc::ENOSYS);
     }
 
@@ -339,7 +1318,13 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn listxattr(&mut self, _req: &fuser::Request<'_>, ino: u64, size: u32, reply: fuser::ReplyXattr) {
+    fn listxattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
         debug!(
             "[Not Implemented] listxattr(ino: {:#x?}, size: {})",
             ino, size
@@ -347,11 +1332,24 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn removexattr(&mut self, _req: &fuser::Request<'_>, ino: u64, name: &std::ffi::OsStr, reply: fuser::ReplyEmpty) {
+    fn removexattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
         debug!(
             "[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
             ino, name
         );
+        
+        // TODO: Quando implementato, aggiungere:
+        // let path = self.inode_to_path(ino).unwrap();
+        // // ... logica di rimozione xattr ...
+        // // Invalida cache per file modificato (metadati extended attributes)
+        // self.invalidate_cache_for_path(&path);
+        
         reply.error(libc::ENOSYS);
     }
 
@@ -375,6 +1373,15 @@ impl Filesystem for RemoteFsClient {
             flags: {:#x?})",
             parent, name, mode, umask, flags
         );
+        
+        // TODO: Quando implementato, aggiungere:
+        // let full_path = self.build_path(parent, name.to_str().unwrap()).unwrap();
+        // // ... logica di creazione file ...
+        // // Invalida cache directory padre
+        // if let Some(parent_path) = self.inode_to_path(parent) {
+        //     self.invalidate_cache_for_directory(&parent_path);
+        // }
+        
         reply.error(libc::ENOSYS);
     }
 
@@ -419,7 +1426,14 @@ impl Filesystem for RemoteFsClient {
         reply.error(libc::ENOSYS);
     }
 
-    fn bmap(&mut self, _req: &fuser::Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: fuser::ReplyBmap) {
+    fn bmap(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        ino: u64,
+        blocksize: u32,
+        idx: u64,
+        reply: fuser::ReplyBmap,
+    ) {
         debug!(
             "[Not Implemented] bmap(ino: {:#x?}, blocksize: {}, idx: {})",
             ino, blocksize, idx,
