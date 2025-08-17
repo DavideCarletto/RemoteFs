@@ -183,49 +183,104 @@ impl RemoteFsClient {
     ) -> Result<FileMetadata, i32> {
         debug!("Creazione filesystem object: {} tipo: {}", path, file_type);
 
-        let create_data = serde_json::json!({
-            "path": path,
-            "file_type": file_type,
-            "mode": mode,
-            "uid": uid,
-            "gid": gid,
-            "rdev": rdev,
-            "umask": umask
-        });
-
         let client = Client::new();
-        let url = format!("{}/create", self.api_url);
 
-        match client.post(&url).json(&create_data).send() {
-            Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
-                Ok(metadata) => {
-                    info!("File creato: {} -> inode {}", path, metadata.ino);
-                    Ok(metadata)
+        if file_type == "Directory" {
+            // Per le directory usiamo POST /mkdir
+            let url = format!("{}/mkdir", self.api_url);
+            let request_data = serde_json::json!({
+                "path": path,
+                "file_type": file_type,
+                "mode": mode,
+                "uid": uid,
+                "gid": gid,
+                "rdev": rdev,
+                "umask": umask
+            });
+
+            match client.post(&url).json(&request_data).send() {
+                Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
+                    Ok(metadata) => {
+                        info!("Directory creata: {} -> inode {}", path, metadata.ino);
+                        Ok(metadata)
+                    }
+                    Err(e) => {
+                        error!(
+                            "Errore parsing JSON in creazione directory per {}: {}",
+                            path, e
+                        );
+                        Err(libc::EIO)
+                    }
+                },
+                Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                    warn!("Directory già esistente: {}", path);
+                    Err(libc::EEXIST)
                 }
-                Err(e) => {
-                    error!("Errore parsing JSON in creazione per {}: {}", path, e);
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                    warn!("Directory padre non trovata per: {}", path);
+                    Err(libc::ENOENT)
+                }
+                Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                    warn!("Permessi insufficienti per creare directory: {}", path);
+                    Err(libc::EACCES)
+                }
+                Ok(resp) => {
+                    error!(
+                        "Errore server in creazione directory per {}: {}",
+                        path,
+                        resp.status()
+                    );
                     Err(libc::EIO)
                 }
-            },
-            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
-                warn!("File già esistente: {}", path);
-                Err(libc::EEXIST)
+                Err(e) => {
+                    error!("Errore di rete in creazione directory per {}: {}", path, e);
+                    Err(libc::EIO)
+                }
             }
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                warn!("Directory padre non trovata per: {}", path);
-                Err(libc::ENOENT)
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
-                warn!("Permessi insufficienti per creare: {}", path);
-                Err(libc::EACCES)
-            }
-            Ok(resp) => {
-                error!("Errore server in creazione per {}: {}", path, resp.status());
-                Err(libc::EIO)
-            }
-            Err(e) => {
-                error!("Errore di rete in creazione per {}: {}", path, e);
-                Err(libc::EIO)
+        } else {
+            // Per i file regolari usiamo POST /files
+            let url = format!("{}/files", self.api_url);
+            let request_data = serde_json::json!({
+                "path": path,
+                "file_type": file_type,
+                "mode": mode,
+                "uid": uid,
+                "gid": gid,
+                "rdev": rdev,
+                "umask": umask
+            });
+
+            match client.post(&url).json(&request_data).send() {
+                Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
+                    Ok(metadata) => {
+                        info!("File creato: {} -> inode {}", path, metadata.ino);
+                        Ok(metadata)
+                    }
+                    Err(e) => {
+                        error!("Errore parsing JSON in creazione per {}: {}", path, e);
+                        Err(libc::EIO)
+                    }
+                },
+                Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                    warn!("File già esistente: {}", path);
+                    Err(libc::EEXIST)
+                }
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                    warn!("Directory padre non trovata per: {}", path);
+                    Err(libc::ENOENT)
+                }
+                Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                    warn!("Permessi insufficienti per creare: {}", path);
+                    Err(libc::EACCES)
+                }
+                Ok(resp) => {
+                    error!("Errore server in creazione per {}: {}", path, resp.status());
+                    Err(libc::EIO)
+                }
+                Err(e) => {
+                    error!("Errore di rete in creazione per {}: {}", path, e);
+                    Err(libc::EIO)
+                }
             }
         }
     }
@@ -238,12 +293,13 @@ impl RemoteFsClient {
         );
 
         let client = Client::new();
-        let url = format!(
-            "{}/remove?path={}&is_directory={}",
-            self.api_url, path, is_directory
-        );
+        let url = format!("{}/files", self.api_url);
 
-        match client.delete(&url).send() {
+        match client
+            .delete(&url)
+            .query(&[("path", path), ("is_directory", &is_directory.to_string())])
+            .send()
+        {
             Ok(resp) if resp.status().is_success() => {
                 info!("Filesystem object rimosso: {}", path);
                 Ok(())
@@ -354,7 +410,7 @@ impl RemoteFsClient {
             );
 
             let client = Client::new();
-            let url = format!("{}/read", self.api_url);
+            let url = format!("{}/files", self.api_url);
 
             let request_data = serde_json::json!({
                 "path": path,
@@ -364,32 +420,29 @@ impl RemoteFsClient {
                 "chunk_index": chunk_index
             });
 
-            match client.post(&url).json(&request_data).send() {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.bytes() {
-                        Ok(chunk_data) => {
-                            result.extend_from_slice(&chunk_data);
-                            current_offset += current_chunk_size as i64;
-                            remaining_size -= current_chunk_size;
-                            chunk_index += 1;
+            match client.get(&url).json(&request_data).send() {
+                Ok(resp) if resp.status().is_success() => match resp.bytes() {
+                    Ok(chunk_data) => {
+                        result.extend_from_slice(&chunk_data);
+                        current_offset += current_chunk_size as i64;
+                        remaining_size -= current_chunk_size;
+                        chunk_index += 1;
 
-                            if chunk_index % 100 == 0 {
-                                let progress =
-                                    ((size - remaining_size) as f64 / size as f64) * 100.0;
-                                info!(
-                                    "Progresso lettura streaming: {:.1}% ({}/{} bytes)",
-                                    progress,
-                                    size - remaining_size,
-                                    size
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            error!("Errore lettura chunk {} per {}: {}", chunk_index, path, e);
-                            return Err(libc::EIO);
+                        if chunk_index % 100 == 0 {
+                            let progress = ((size - remaining_size) as f64 / size as f64) * 100.0;
+                            info!(
+                                "Progresso lettura streaming: {:.1}% ({}/{} bytes)",
+                                progress,
+                                size - remaining_size,
+                                size
+                            );
                         }
                     }
-                }
+                    Err(e) => {
+                        error!("Errore lettura chunk {} per {}: {}", chunk_index, path, e);
+                        return Err(libc::EIO);
+                    }
+                },
                 Ok(resp) => {
                     error!(
                         "Errore server lettura chunk {} per {}: {}",
@@ -423,7 +476,7 @@ impl RemoteFsClient {
 
         let client = Client::new();
         let response = client
-            .get(&format!("{}/listdir", self.api_url))
+            .get(&format!("{}/list", self.api_url))
             .query(&[("path", path)])
             .send();
 
@@ -563,9 +616,9 @@ impl RemoteFsClient {
 
             let client = Client::new();
 
-            let url = format!("{}/write", self.api_url);
+            let url = format!("{}/files", self.api_url);
             let response = client
-                .post(&url)
+                .put(&url)
                 .header("Content-Type", "application/octet-stream")
                 .header("X-Path", path)
                 .header("X-File-Handle", file_handle.to_string())
@@ -650,8 +703,7 @@ impl Filesystem for RemoteFsClient {
             }
         }
     }
-    
-    
+
     fn destroy(&mut self) {
         info!("Filesystem remoto smontato e distrutto");
         // Puoi aggiungere cleanup qui se necessario:
@@ -1285,7 +1337,10 @@ impl Filesystem for RemoteFsClient {
         let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
-                error!("Impossibile trovare il percorso per inode {:#x} in access", ino);
+                error!(
+                    "Impossibile trovare il percorso per inode {:#x} in access",
+                    ino
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -1415,7 +1470,10 @@ impl Filesystem for RemoteFsClient {
                 match self.open_file(&full_path, flags) {
                     Ok(file_handle) => {
                         let file_attr = metadata.to_file_attr();
-                        info!("File created and opened: {} -> fh {}", full_path, file_handle);
+                        info!(
+                            "File created and opened: {} -> fh {}",
+                            full_path, file_handle
+                        );
                         reply.created(
                             &std::time::Duration::from_secs(1),
                             &file_attr,
@@ -1438,4 +1496,107 @@ impl Filesystem for RemoteFsClient {
         }
     }
 
+    fn flush(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("flush(ino: {:#x}, fh: {})", _ino, _fh);
+        reply.ok();
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        name: &std::ffi::OsStr,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        debug!("getxattr(ino: {:#x}, name: {:?}, size: {})", _ino, name, size);
+        reply.error(libc::ENODATA);
+    }
+
+    fn listxattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        debug!("listxattr(ino: {:#x}, size: {})", _ino, size);
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        name: &std::ffi::OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!(
+            "setxattr(ino: {:#x}, name: {:?}, value_len: {}, flags: {}, position: {})",
+            _ino, name, value.len(), flags, position
+        );
+        reply.error(libc::ENOTSUP);
+    }
+
+    fn removexattr(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("removexattr(ino: {:#x}, name: {:?})", _ino, name);
+        reply.error(libc::ENODATA);
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("fsync(ino: {:#x}, fh: {}, datasync: {})", _ino, _fh, _datasync);
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("fsyncdir(ino: {:#x}, fh: {}, datasync: {})", _ino, _fh, _datasync);
+        reply.ok();
+    }
+
+    fn opendir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _flags: i32,
+        reply: fuser::ReplyOpen,
+    ) {
+        debug!("opendir(ino: {:#x}, flags: {:#x})", _ino, _flags);
+        // Genera un file handle fittizio per la directory
+        let dir_handle = 0;
+        reply.opened(dir_handle, 0);
+    }
 }
