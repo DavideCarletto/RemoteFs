@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::time::{Duration, SystemTime};
 
 const MAX_NAME_LENGTH: u32 = 255;
+const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks per tutti i file
 
 #[derive(Deserialize)]
 struct FileMetadata {
@@ -137,25 +138,27 @@ impl RemoteFsClient {
         }
     }
 
-    fn update_file_attributes(&self, path: &str, updates: serde_json::Value) -> Option<FileMetadata> {
+    fn update_file_attributes(
+        &self,
+        path: &str,
+        updates: serde_json::Value,
+    ) -> Option<FileMetadata> {
         debug!("Aggiornamento attributi per: {} con {:?}", path, updates);
-        
+
         let client = Client::new();
         let url = format!("{}/metadata?path={}", self.api_url, path);
-        
+
         match client.patch(&url).json(&updates).send() {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<FileMetadata>() {
-                    Ok(metadata) => {
-                        info!("Attributi aggiornati per {}: inode {}", path, metadata.ino);
-                        Some(metadata)
-                    }
-                    Err(e) => {
-                        error!("Errore parsing JSON per {}: {}", path, e);
-                        None
-                    }
+            Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
+                Ok(metadata) => {
+                    info!("Attributi aggiornati per {}: inode {}", path, metadata.ino);
+                    Some(metadata)
                 }
-            }
+                Err(e) => {
+                    error!("Errore parsing JSON per {}: {}", path, e);
+                    None
+                }
+            },
             Ok(resp) => {
                 error!("Errore server per {}: {}", path, resp.status());
                 None
@@ -168,9 +171,18 @@ impl RemoteFsClient {
     }
 
     /// Crea un nuovo filesystem object (file, directory, etc.) sul server tramite chiamata HTTP
-    fn create_filesystem_object(&self, path: &str, file_type: &str, mode: u32, uid: u32, gid: u32, rdev: u32, umask: u32) -> Result<FileMetadata, i32> {
+    fn create_filesystem_object(
+        &self,
+        path: &str,
+        file_type: &str,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        rdev: u32,
+        umask: u32,
+    ) -> Result<FileMetadata, i32> {
         debug!("Creazione filesystem object: {} tipo: {}", path, file_type);
-        
+
         let create_data = serde_json::json!({
             "path": path,
             "file_type": file_type,
@@ -185,18 +197,16 @@ impl RemoteFsClient {
         let url = format!("{}/create", self.api_url);
 
         match client.post(&url).json(&create_data).send() {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<FileMetadata>() {
-                    Ok(metadata) => {
-                        info!("File creato: {} -> inode {}", path, metadata.ino);
-                        Ok(metadata)
-                    }
-                    Err(e) => {
-                        error!("Errore parsing JSON in creazione per {}: {}", path, e);
-                        Err(libc::EIO)
-                    }
+            Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
+                Ok(metadata) => {
+                    info!("File creato: {} -> inode {}", path, metadata.ino);
+                    Ok(metadata)
                 }
-            }
+                Err(e) => {
+                    error!("Errore parsing JSON in creazione per {}: {}", path, e);
+                    Err(libc::EIO)
+                }
+            },
             Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
                 warn!("File già esistente: {}", path);
                 Err(libc::EEXIST)
@@ -222,10 +232,16 @@ impl RemoteFsClient {
 
     /// Rimuove un filesystem object (file, directory, etc.) dal server tramite chiamata HTTP
     fn remove_filesystem_object(&self, path: &str, is_directory: bool) -> Result<(), i32> {
-        debug!("Rimozione filesystem object: {} (directory: {})", path, is_directory);
+        debug!(
+            "Rimozione filesystem object: {} (directory: {})",
+            path, is_directory
+        );
 
         let client = Client::new();
-        let url = format!("{}/remove?path={}&is_directory={}", self.api_url, path, is_directory);
+        let url = format!(
+            "{}/remove?path={}&is_directory={}",
+            self.api_url, path, is_directory
+        );
 
         match client.delete(&url).send() {
             Ok(resp) if resp.status().is_success() => {
@@ -267,23 +283,24 @@ impl RemoteFsClient {
         });
 
         match client.post(&url).json(&open_data).send() {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>() {
-                    Ok(response) => {
-                        if let Some(fh) = response.get("file_handle").and_then(|v| v.as_u64()) {
-                            info!("File aperto: {} -> file handle {}", path, fh);
-                            Ok(fh)
-                        } else {
-                            error!("Risposta server non valida per apertura {}: manca file_handle", path);
-                            Err(libc::EIO)
-                        }
-                    }
-                    Err(e) => {
-                        error!("Errore parsing JSON in apertura per {}: {}", path, e);
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>() {
+                Ok(response) => {
+                    if let Some(fh) = response.get("file_handle").and_then(|v| v.as_u64()) {
+                        info!("File aperto: {} -> file handle {}", path, fh);
+                        Ok(fh)
+                    } else {
+                        error!(
+                            "Risposta server non valida per apertura {}: manca file_handle",
+                            path
+                        );
                         Err(libc::EIO)
                     }
                 }
-            }
+                Err(e) => {
+                    error!("Errore parsing JSON in apertura per {}: {}", path, e);
+                    Err(libc::EIO)
+                }
+            },
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
                 warn!("File non trovato per apertura: {}", path);
                 Err(libc::ENOENT)
@@ -303,50 +320,101 @@ impl RemoteFsClient {
         }
     }
 
-    /// Legge dati da un file sul server tramite chiamata HTTP
-    fn read_file(&self, path: &str, file_handle: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        debug!("Lettura file: {} (fh: {}, offset: {}, size: {})", path, file_handle, offset, size);
+    /// Legge dati da un file sul server tramite chiamata HTTP con streaming
+    fn read_file(
+        &self,
+        path: &str,
+        file_handle: u64,
+        offset: i64,
+        size: u32,
+    ) -> Result<Vec<u8>, i32> {
+        debug!(
+            "Lettura file in streaming: {} (fh: {}, offset: {}, size: {})",
+            path, file_handle, offset, size
+        );
 
-        let client = Client::new();
-        let url = format!("{}/read", self.api_url);
+        let mut result = Vec::new();
+        let mut current_offset = offset;
+        let mut remaining_size = size;
+        let mut chunk_index = 0;
 
-        let read_data = serde_json::json!({
-            "path": path,
-            "file_handle": file_handle,
-            "offset": offset,
-            "size": size
-        });
+        info!(
+            "Inizio lettura streaming: offset={}, size={} bytes, chunk_size={}KB",
+            offset,
+            size,
+            CHUNK_SIZE / 1024
+        );
 
-        match client.post(&url).json(&read_data).send() {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.bytes() {
-                    Ok(data) => {
-                        info!("Letti {} bytes da {}", data.len(), path);
-                        Ok(data.to_vec())
-                    }
-                    Err(e) => {
-                        error!("Errore lettura risposta per {}: {}", path, e);
-                        Err(libc::EIO)
+        while remaining_size > 0 {
+            let current_chunk_size = std::cmp::min(remaining_size, CHUNK_SIZE as u32);
+
+            debug!(
+                "Lettura chunk {}: offset={}, size={} bytes",
+                chunk_index, current_offset, current_chunk_size
+            );
+
+            let client = Client::new();
+            let url = format!("{}/read", self.api_url);
+
+            let request_data = serde_json::json!({
+                "path": path,
+                "file_handle": file_handle,
+                "offset": current_offset,
+                "size": current_chunk_size,
+                "chunk_index": chunk_index
+            });
+
+            match client.post(&url).json(&request_data).send() {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.bytes() {
+                        Ok(chunk_data) => {
+                            result.extend_from_slice(&chunk_data);
+                            current_offset += current_chunk_size as i64;
+                            remaining_size -= current_chunk_size;
+                            chunk_index += 1;
+
+                            if chunk_index % 100 == 0 {
+                                let progress =
+                                    ((size - remaining_size) as f64 / size as f64) * 100.0;
+                                info!(
+                                    "Progresso lettura streaming: {:.1}% ({}/{} bytes)",
+                                    progress,
+                                    size - remaining_size,
+                                    size
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("Errore lettura chunk {} per {}: {}", chunk_index, path, e);
+                            return Err(libc::EIO);
+                        }
                     }
                 }
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                warn!("File non trovato per lettura: {}", path);
-                Err(libc::ENOENT)
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST => {
-                warn!("File handle non valido per {}: {}", path, file_handle);
-                Err(libc::EBADF)
-            }
-            Ok(resp) => {
-                error!("Errore server in lettura per {}: {}", path, resp.status());
-                Err(libc::EIO)
-            }
-            Err(e) => {
-                error!("Errore di rete in lettura per {}: {}", path, e);
-                Err(libc::EIO)
+                Ok(resp) => {
+                    error!(
+                        "Errore server lettura chunk {} per {}: {}",
+                        chunk_index,
+                        path,
+                        resp.status()
+                    );
+                    return Err(libc::EIO);
+                }
+                Err(e) => {
+                    error!(
+                        "Errore rete lettura chunk {} per {}: {}",
+                        chunk_index, path, e
+                    );
+                    return Err(libc::EIO);
+                }
             }
         }
+
+        info!(
+            "Lettura streaming completata: {} chunks, {} bytes totali",
+            chunk_index,
+            result.len()
+        );
+        Ok(result)
     }
 
     /// Lista il contenuto di una directory dal server
@@ -360,40 +428,41 @@ impl RemoteFsClient {
             .send();
 
         match response {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<serde_json::Value>() {
-                    Ok(data) => {
-                        if let Some(entries) = data.get("entries").and_then(|v| v.as_array()) {
-                            let mut result = Vec::new();
-                            
-                            for entry in entries {
-                                if let (Some(name), Some(ino), Some(file_type)) = (
-                                    entry.get("name").and_then(|v| v.as_str()),
-                                    entry.get("ino").and_then(|v| v.as_u64()),
-                                    entry.get("file_type").and_then(|v| v.as_str())
-                                ) {
-                                    let fuse_type = match file_type {
-                                        "Directory" => fuser::FileType::Directory,
-                                        "RegularFile" => fuser::FileType::RegularFile,
-                                        _ => fuser::FileType::RegularFile,
-                                    };
-                                    result.push((name.to_string(), ino, fuse_type));
-                                }
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>() {
+                Ok(data) => {
+                    if let Some(entries) = data.get("entries").and_then(|v| v.as_array()) {
+                        let mut result = Vec::new();
+
+                        for entry in entries {
+                            if let (Some(name), Some(ino), Some(file_type)) = (
+                                entry.get("name").and_then(|v| v.as_str()),
+                                entry.get("ino").and_then(|v| v.as_u64()),
+                                entry.get("file_type").and_then(|v| v.as_str()),
+                            ) {
+                                let fuse_type = match file_type {
+                                    "Directory" => fuser::FileType::Directory,
+                                    "RegularFile" => fuser::FileType::RegularFile,
+                                    _ => fuser::FileType::RegularFile,
+                                };
+                                result.push((name.to_string(), ino, fuse_type));
                             }
-                            
-                            info!("Directory {} contiene {} elementi", path, result.len());
-                            Ok(result)
-                        } else {
-                            error!("Risposta server non valida per listdir {}: manca entries", path);
-                            Err(libc::ENOENT)
                         }
-                    }
-                    Err(e) => {
-                        error!("Errore parsing JSON per listdir {}: {}", path, e);
-                        Err(libc::EIO)
+
+                        info!("Directory {} contiene {} elementi", path, result.len());
+                        Ok(result)
+                    } else {
+                        error!(
+                            "Risposta server non valida per listdir {}: manca entries",
+                            path
+                        );
+                        Err(libc::ENOENT)
                     }
                 }
-            }
+                Err(e) => {
+                    error!("Errore parsing JSON per listdir {}: {}", path, e);
+                    Err(libc::EIO)
+                }
+            },
             Ok(resp) => {
                 error!("Errore server in listdir per {}: {}", path, resp.status());
                 Err(libc::EIO)
@@ -403,6 +472,157 @@ impl RemoteFsClient {
                 Err(libc::EIO)
             }
         }
+    }
+
+    /// Rinomina/sposta un file o directory sul server tramite chiamata HTTP
+    fn rename_filesystem_object(&self, old_path: &str, new_path: &str) -> Result<(), i32> {
+        debug!("Rinomina filesystem object: {} -> {}", old_path, new_path);
+
+        let client = Client::new();
+        let url = format!("{}/rename", self.api_url);
+
+        let rename_data = serde_json::json!({
+            "old_path": old_path,
+            "new_path": new_path
+        });
+
+        match client.post(&url).json(&rename_data).send() {
+            Ok(resp) if resp.status().is_success() => {
+                info!("Filesystem object rinominato: {} -> {}", old_path, new_path);
+                Ok(())
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per rinomina: {}", old_path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                warn!("File destinazione già esistente: {}", new_path);
+                Err(libc::EEXIST)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST => {
+                warn!(
+                    "Operazione di rinomina non valida: {} -> {}",
+                    old_path, new_path
+                );
+                Err(libc::EINVAL)
+            }
+            Ok(resp) => {
+                error!(
+                    "Errore server in rinomina per {} -> {}: {}",
+                    old_path,
+                    new_path,
+                    resp.status()
+                );
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!(
+                    "Errore di rete in rinomina per {} -> {}: {}",
+                    old_path, new_path, e
+                );
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Scrive dati in un file sul server tramite chiamata HTTP con streaming
+    fn write_file(
+        &self,
+        path: &str,
+        file_handle: u64,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<u32, i32> {
+        debug!(
+            "Scrittura file in streaming: {} (fh: {}, offset: {}, size: {})",
+            path,
+            file_handle,
+            offset,
+            data.len()
+        );
+
+        let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
+        let total_chunks = chunks.len();
+        let mut total_written = 0u32;
+
+        info!(
+            "Inizio scrittura streaming: {} chunks da {}KB ciascuno",
+            total_chunks,
+            CHUNK_SIZE / 1024
+        );
+
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
+            let chunk_offset = offset + (chunk_index * CHUNK_SIZE) as i64;
+
+            debug!(
+                "Scrittura chunk {}/{} ({}KB)",
+                chunk_index + 1,
+                total_chunks,
+                chunk.len() / 1024
+            );
+
+            let client = Client::new();
+
+            let url = format!("{}/write", self.api_url);
+            let response = client
+                .post(&url)
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Path", path)
+                .header("X-File-Handle", file_handle.to_string())
+                .header("X-Offset", chunk_offset.to_string())
+                .body(chunk.to_vec())
+                .send();
+
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<serde_json::Value>() {
+                        Ok(response_data) => {
+                            if let Some(bytes_written) =
+                                response_data.get("bytes_written").and_then(|v| v.as_u64())
+                            {
+                                total_written += bytes_written as u32;
+
+                                // Progress feedback ogni 50 chunk
+                                if chunk_index % 50 == 0 && total_chunks > 1 {
+                                    let progress =
+                                        ((chunk_index + 1) as f32 / total_chunks as f32) * 100.0;
+                                    info!(
+                                        "Chunk {}/{} completato - Progresso: {:.1}%",
+                                        chunk_index + 1,
+                                        total_chunks,
+                                        progress
+                                    );
+                                }
+                            } else {
+                                error!(
+                                    "Risposta server non valida per chunk {}: manca bytes_written",
+                                    chunk_index
+                                );
+                                return Err(libc::EIO);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Errore parsing JSON per chunk {}: {}", chunk_index, e);
+                            return Err(libc::EIO);
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    error!("Errore server per chunk {}: {}", chunk_index, resp.status());
+                    return Err(libc::EIO);
+                }
+                Err(e) => {
+                    error!("Errore di rete per chunk {}: {}", chunk_index, e);
+                    return Err(libc::EIO);
+                }
+            }
+        }
+
+        info!(
+            "Scrittura streaming completata: {} bytes scritti in {} chunks",
+            total_written, total_chunks
+        );
+        Ok(total_written)
     }
 }
 
@@ -430,6 +650,8 @@ impl Filesystem for RemoteFsClient {
             }
         }
     }
+    
+    
     fn destroy(&mut self) {
         info!("Filesystem remoto smontato e distrutto");
         // Puoi aggiungere cleanup qui se necessario:
@@ -452,7 +674,6 @@ impl Filesystem for RemoteFsClient {
             return;
         }
 
-        // Converti OsStr in String
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {
@@ -462,7 +683,6 @@ impl Filesystem for RemoteFsClient {
             }
         };
 
-        // Costruisci il percorso completo
         let full_path = match self.build_path(parent, name_str) {
             Some(path) => path,
             None => {
@@ -475,7 +695,6 @@ impl Filesystem for RemoteFsClient {
             }
         };
 
-        // Richiedi metadati al server
         match self.get_file_metadata(&full_path) {
             Some(metadata) => {
                 let file_attr = metadata.to_file_attr();
@@ -490,13 +709,11 @@ impl Filesystem for RemoteFsClient {
         }
     }
 
-    fn forget(&mut self, _req: &fuser::Request<'_>, _ino: u64, _nlookup: u64) {} //implement only if filesystem implements inode lifetimes
-
     fn getattr(
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        fh: Option<u64>,
+        _fh: Option<u64>,
         reply: fuser::ReplyAttr,
     ) {
         debug!("getattr(ino: {:#x?} )", ino);
@@ -533,18 +750,18 @@ impl Filesystem for RemoteFsClient {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        fh: Option<u64>,
+        _fh: Option<u64>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
         flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        let path = match self.inode_to_path(ino){
+        let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
                 reply.error(libc::ENOENT);
-                return
+                return;
             }
         };
 
@@ -555,7 +772,7 @@ impl Filesystem for RemoteFsClient {
             "size": size,
             "flags": flags,
         });
-        
+
         match self.update_file_attributes(path.as_str(), updates.clone()) {
             Some(metadata) => {
                 let file_attr = metadata.to_file_attr();
@@ -566,11 +783,6 @@ impl Filesystem for RemoteFsClient {
                 reply.error(libc::ENOENT);
             }
         }
-    }
-
-    fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
-        debug!("[Not Implemented] readlink(ino: {:#x?})", ino);
-        reply.error(libc::ENOSYS);
     }
 
     fn mknod(
@@ -616,7 +828,7 @@ impl Filesystem for RemoteFsClient {
 
         let file_type = match mode & libc::S_IFMT {
             libc::S_IFREG => "RegularFile",
-            libc::S_IFDIR => "Directory", 
+            libc::S_IFDIR => "Directory",
             libc::S_IFLNK => "Symlink",
             libc::S_IFBLK => "BlockDevice",
             libc::S_IFCHR => "CharDevice",
@@ -630,7 +842,15 @@ impl Filesystem for RemoteFsClient {
         };
 
         let permissions = mode & !libc::S_IFMT;
-        match self.create_filesystem_object(&full_path, file_type, permissions, _req.uid(), _req.gid(), rdev, umask) {
+        match self.create_filesystem_object(
+            &full_path,
+            file_type,
+            permissions,
+            _req.uid(),
+            _req.gid(),
+            rdev,
+            umask,
+        ) {
             Ok(metadata) => {
                 let file_attr = metadata.to_file_attr();
                 reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
@@ -684,7 +904,15 @@ impl Filesystem for RemoteFsClient {
         let file_type = "Directory";
         let permissions = mode & !libc::S_IFMT;
 
-        match self.create_filesystem_object(&full_path, file_type, permissions, _req.uid(), _req.gid(), 0, umask) {
+        match self.create_filesystem_object(
+            &full_path,
+            file_type,
+            permissions,
+            _req.uid(),
+            _req.gid(),
+            0,
+            umask,
+        ) {
             Ok(metadata) => {
                 let file_attr = metadata.to_file_attr();
                 reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
@@ -702,10 +930,7 @@ impl Filesystem for RemoteFsClient {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!(
-            "unlink(parent: {:#x?}, name: {:?})",
-            parent, name,
-        );
+        debug!("unlink(parent: {:#x?}, name: {:?})", parent, name,);
 
         if name.len() > MAX_NAME_LENGTH as usize {
             reply.error(libc::ENAMETOOLONG);
@@ -750,10 +975,7 @@ impl Filesystem for RemoteFsClient {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!(
-            "rmdir(parent: {:#x?}, name: {:?})",
-            parent, name,
-        );
+        debug!("rmdir(parent: {:#x?}, name: {:?})", parent, name,);
 
         if name.len() > MAX_NAME_LENGTH as usize {
             reply.error(libc::ENAMETOOLONG);
@@ -791,21 +1013,6 @@ impl Filesystem for RemoteFsClient {
         }
     }
 
-    fn symlink(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        parent: u64,
-        link_name: &std::ffi::OsStr,
-        target: &std::path::Path,
-        reply: fuser::ReplyEntry,
-    ) {
-        debug!(
-            "[Not Implemented] symlink(parent: {:#x?}, link_name: {:?}, target: {:?})",
-            parent, link_name, target,
-        );
-        reply.error(libc::EPERM);
-    }
-
     fn rename(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -817,26 +1024,68 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyEmpty,
     ) {
         debug!(
-            "[Not Implemented] rename(parent: {:#x?}, name: {:?}, newparent: {:#x?}, \
-            newname: {:?}, flags: {})",
+            "rename(parent: {:#x?}, name: {:?}, newparent: {:#x?}, newname: {:?}, flags: {})",
             parent, name, newparent, newname, flags,
         );
-        reply.error(libc::ENOSYS);
-    }
 
-    fn link(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        newparent: u64,
-        newname: &std::ffi::OsStr,
-        reply: fuser::ReplyEntry,
-    ) {
-        debug!(
-            "[Not Implemented] link(ino: {:#x?}, newparent: {:#x?}, newname: {:?})",
-            ino, newparent, newname
-        );
-        reply.error(libc::EPERM);
+        if name.len() > MAX_NAME_LENGTH as usize || newname.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome file sorgente non valido per rename: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let newname_str = match newname.to_str() {
+            Some(s) => s,
+            None => {
+                error!(
+                    "Nome file destinazione non valido per rename: {:?}",
+                    newname
+                );
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let old_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso sorgente per rename: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let new_path = match self.build_path(newparent, newname_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso destinazione per rename: parent {} + {}",
+                    newparent, newname_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.rename_filesystem_object(&old_path, &new_path) {
+            Ok(()) => {
+                reply.ok();
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
@@ -845,7 +1094,10 @@ impl Filesystem for RemoteFsClient {
         let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
-                error!("Impossibile trovare il percorso per inode {:#x} in open", ino);
+                error!(
+                    "Impossibile trovare il percorso per inode {:#x} in open",
+                    ino
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -880,7 +1132,10 @@ impl Filesystem for RemoteFsClient {
         let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
-                error!("Impossibile trovare il percorso per inode {:#x} in read", ino);
+                error!(
+                    "Impossibile trovare il percorso per inode {:#x} in read",
+                    ino
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -909,8 +1164,7 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyWrite,
     ) {
         debug!(
-            "[Not Implemented] write(ino: {:#x?}, fh: {}, offset: {}, data.len(): {}, \
-            write_flags: {:#x?}, flags: {:#x?}, lock_owner: {:?})",
+            "write(ino: {:#x}, fh: {}, offset: {}, data.len(): {}, write_flags: {:#x}, flags: {:#x}, lock_owner: {:?})",
             ino,
             fh,
             offset,
@@ -919,22 +1173,27 @@ impl Filesystem for RemoteFsClient {
             flags,
             lock_owner
         );
-        reply.error(libc::ENOSYS);
-    }
 
-    fn flush(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        lock_owner: u64,
-        reply: fuser::ReplyEmpty,
-    ) {
-        debug!(
-            "[Not Implemented] flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
-            ino, fh, lock_owner
-        );
-        reply.error(libc::ENOSYS);
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!(
+                    "Impossibile trovare il percorso per inode {:#x} in write",
+                    ino
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match self.write_file(&path, fh, offset, data) {
+            Ok(bytes_written) => {
+                reply.written(bytes_written);
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
     fn release(
@@ -950,31 +1209,6 @@ impl Filesystem for RemoteFsClient {
         reply.ok();
     }
 
-    fn fsync(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        datasync: bool,
-        reply: fuser::ReplyEmpty,
-    ) {
-        debug!(
-            "[Not Implemented] fsync(ino: {:#x?}, fh: {}, datasync: {})",
-            ino, fh, datasync
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn opendir(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        _ino: u64,
-        _flags: i32,
-        reply: fuser::ReplyOpen,
-    ) {
-        reply.opened(0, 0);
-    }
-
     fn readdir(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -988,7 +1222,10 @@ impl Filesystem for RemoteFsClient {
         let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
-                error!("Impossibile trovare il percorso per inode {:#x} in readdir", ino);
+                error!(
+                    "Impossibile trovare il percorso per inode {:#x} in readdir",
+                    ino
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -1011,29 +1248,20 @@ impl Filesystem for RemoteFsClient {
             full_entries.push((name, entry_ino, file_type));
         }
 
-        for (i, (name, entry_ino, file_type)) in full_entries.iter().enumerate().skip(offset as usize) {
+        for (i, (name, entry_ino, file_type)) in
+            full_entries.iter().enumerate().skip(offset as usize)
+        {
             if reply.add(*entry_ino, (i + 1) as i64, *file_type, name.as_str()) {
                 break;
             }
         }
 
-        info!("Readdir completato per {}: {} entries", path, full_entries.len());
-        reply.ok();
-    }
-
-    fn readdirplus(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        reply: fuser::ReplyDirectoryPlus,
-    ) {
-        debug!(
-            "[Not Implemented] readdirplus(ino: {:#x?}, fh: {}, offset: {})",
-            ino, fh, offset
+        info!(
+            "Readdir completato per {}: {} entries",
+            path,
+            full_entries.len()
         );
-        reply.error(libc::ENOSYS);
+        reply.ok();
     }
 
     fn releasedir(
@@ -1047,88 +1275,85 @@ impl Filesystem for RemoteFsClient {
         reply.ok();
     }
 
-    fn fsyncdir(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        datasync: bool,
-        reply: fuser::ReplyEmpty,
-    ) {
-        debug!(
-            "[Not Implemented] fsyncdir(ino: {:#x?}, fh: {}, datasync: {})",
-            ino, fh, datasync
-        );
-        reply.error(libc::ENOSYS);
-    }
-
     fn statfs(&mut self, _req: &fuser::Request<'_>, _ino: u64, reply: fuser::ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
 
-    fn setxattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        name: &std::ffi::OsStr,
-        _value: &[u8],
-        flags: i32,
-        position: u32,
-        reply: fuser::ReplyEmpty,
-    ) {
-        debug!(
-            "[Not Implemented] setxattr(ino: {:#x?}, name: {:?}, flags: {:#x?}, position: {})",
-            ino, name, flags, position
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn getxattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        name: &std::ffi::OsStr,
-        size: u32,
-        reply: fuser::ReplyXattr,
-    ) {
-        debug!(
-            "[Not Implemented] getxattr(ino: {:#x?}, name: {:?}, size: {})",
-            ino, name, size
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn listxattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        size: u32,
-        reply: fuser::ReplyXattr,
-    ) {
-        debug!(
-            "[Not Implemented] listxattr(ino: {:#x?}, size: {})",
-            ino, size
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn removexattr(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        name: &std::ffi::OsStr,
-        reply: fuser::ReplyEmpty,
-    ) {
-        debug!(
-            "[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
-            ino, name
-        );
-        reply.error(libc::ENOSYS);
-    }
-
     fn access(&mut self, _req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
-        debug!("[Not Implemented] access(ino: {:#x?}, mask: {})", ino, mask);
-        reply.error(libc::ENOSYS);
+        debug!("access(ino: {:#x}, mask: {:#o})", ino, mask);
+
+        let path = match self.inode_to_path(ino) {
+            Some(p) => p,
+            None => {
+                error!("Impossibile trovare il percorso per inode {:#x} in access", ino);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Ottieni i metadati del file per controllare i permessi
+        match self.get_file_metadata(&path) {
+            Some(metadata) => {
+                let file_mode = metadata.permissions as i32;
+                let uid = _req.uid();
+                let gid = _req.gid();
+
+                // Controllo permessi semplificato
+                let mut allowed = true;
+
+                // Se l'utente è root, ha sempre accesso
+                if uid == 0 {
+                    reply.ok();
+                    return;
+                }
+
+                // Controllo permessi utente/gruppo/altri
+                if mask & libc::R_OK != 0 {
+                    // Controllo lettura
+                    if uid == metadata.uid {
+                        allowed &= (file_mode & 0o400) != 0; // user read
+                    } else if gid == metadata.gid {
+                        allowed &= (file_mode & 0o040) != 0; // group read
+                    } else {
+                        allowed &= (file_mode & 0o004) != 0; // other read
+                    }
+                }
+
+                if mask & libc::W_OK != 0 {
+                    // Controllo scrittura
+                    if uid == metadata.uid {
+                        allowed &= (file_mode & 0o200) != 0; // user write
+                    } else if gid == metadata.gid {
+                        allowed &= (file_mode & 0o020) != 0; // group write
+                    } else {
+                        allowed &= (file_mode & 0o002) != 0; // other write
+                    }
+                }
+
+                if mask & libc::X_OK != 0 {
+                    // Controllo esecuzione
+                    if uid == metadata.uid {
+                        allowed &= (file_mode & 0o100) != 0; // user execute
+                    } else if gid == metadata.gid {
+                        allowed &= (file_mode & 0o010) != 0; // group execute
+                    } else {
+                        allowed &= (file_mode & 0o001) != 0; // other execute
+                    }
+                }
+
+                if allowed {
+                    debug!("Access granted for {} (mask: {:#o})", path, mask);
+                    reply.ok();
+                } else {
+                    debug!("Access denied for {} (mask: {:#o})", path, mask);
+                    reply.error(libc::EACCES);
+                }
+            }
+            None => {
+                warn!("File non trovato per access: {}", path);
+                reply.error(libc::ENOENT);
+            }
+        }
     }
 
     fn create(
@@ -1142,146 +1367,75 @@ impl Filesystem for RemoteFsClient {
         reply: fuser::ReplyCreate,
     ) {
         debug!(
-            "[Not Implemented] create(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?}, \
-            flags: {:#x?})",
+            "create(parent: {:#x}, name: {:?}, mode: {:#o}, umask: {:#o}, flags: {:#x})",
             parent, name, mode, umask, flags
         );
-        reply.error(libc::ENOSYS);
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome file non valido per create: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per create: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Crea il file (sempre RegularFile per create)
+        let file_type = "RegularFile";
+        let permissions = mode & !libc::S_IFMT;
+
+        match self.create_filesystem_object(
+            &full_path,
+            file_type,
+            permissions,
+            _req.uid(),
+            _req.gid(),
+            0,
+            umask,
+        ) {
+            Ok(metadata) => {
+                // File creato con successo, ora aprilo
+                match self.open_file(&full_path, flags) {
+                    Ok(file_handle) => {
+                        let file_attr = metadata.to_file_attr();
+                        info!("File created and opened: {} -> fh {}", full_path, file_handle);
+                        reply.created(
+                            &std::time::Duration::from_secs(1),
+                            &file_attr,
+                            0,
+                            file_handle,
+                            0,
+                        );
+                    }
+                    Err(error_code) => {
+                        error!("Errore apertura file dopo creazione: {}", full_path);
+                        // File creato ma non aperto - rimuovilo per consistenza
+                        let _ = self.remove_filesystem_object(&full_path, false);
+                        reply.error(error_code);
+                    }
+                }
+            }
+            Err(error_code) => {
+                reply.error(error_code);
+            }
+        }
     }
 
-    fn getlk(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        lock_owner: u64,
-        start: u64,
-        end: u64,
-        typ: i32,
-        pid: u32,
-        reply: fuser::ReplyLock,
-    ) {
-        debug!(
-            "[Not Implemented] getlk(ino: {:#x?}, fh: {}, lock_owner: {}, start: {}, \
-            end: {}, typ: {}, pid: {})",
-            ino, fh, lock_owner, start, end, typ, pid
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn setlk(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        lock_owner: u64,
-        start: u64,
-        end: u64,
-        typ: i32,
-        pid: u32,
-        sleep: bool,
-        reply: fuser::ReplyEmpty,
-    ) {
-        debug!(
-            "[Not Implemented] setlk(ino: {:#x?}, fh: {}, lock_owner: {}, start: {}, \
-            end: {}, typ: {}, pid: {}, sleep: {})",
-            ino, fh, lock_owner, start, end, typ, pid, sleep
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn bmap(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        blocksize: u32,
-        idx: u64,
-        reply: fuser::ReplyBmap,
-    ) {
-        debug!(
-            "[Not Implemented] bmap(ino: {:#x?}, blocksize: {}, idx: {})",
-            ino, blocksize, idx,
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn ioctl(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        flags: u32,
-        cmd: u32,
-        in_data: &[u8],
-        out_size: u32,
-        reply: fuser::ReplyIoctl,
-    ) {
-        debug!(
-            "[Not Implemented] ioctl(ino: {:#x?}, fh: {}, flags: {}, cmd: {}, \
-            in_data.len(): {}, out_size: {})",
-            ino,
-            fh,
-            flags,
-            cmd,
-            in_data.len(),
-            out_size,
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn fallocate(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        length: i64,
-        mode: i32,
-        reply: fuser::ReplyEmpty,
-    ) {
-        debug!(
-            "[Not Implemented] fallocate(ino: {:#x?}, fh: {}, offset: {}, \
-            length: {}, mode: {})",
-            ino, fh, offset, length, mode
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn lseek(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
-        offset: i64,
-        whence: i32,
-        reply: fuser::ReplyLseek,
-    ) {
-        debug!(
-            "[Not Implemented] lseek(ino: {:#x?}, fh: {}, offset: {}, whence: {})",
-            ino, fh, offset, whence
-        );
-        reply.error(libc::ENOSYS);
-    }
-
-    fn copy_file_range(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        ino_in: u64,
-        fh_in: u64,
-        offset_in: i64,
-        ino_out: u64,
-        fh_out: u64,
-        offset_out: i64,
-        len: u64,
-        flags: u32,
-        reply: fuser::ReplyWrite,
-    ) {
-        debug!(
-            "[Not Implemented] copy_file_range(ino_in: {:#x?}, fh_in: {}, \
-            offset_in: {}, ino_out: {:#x?}, fh_out: {}, offset_out: {}, \
-            len: {}, flags: {})",
-            ino_in, fh_in, offset_in, ino_out, fh_out, offset_out, len, flags
-        );
-        reply.error(libc::ENOSYS);
-    }
 }

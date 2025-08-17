@@ -24,6 +24,22 @@ interface INode {
   blksize: number;
 }
 
+const testContent = Buffer.from("Questo è il contenuto del file test.txt\nSeconda riga di esempio\n");
+const readmeContent = Buffer.from(`# Remote Filesystem
+    
+Questo è un esempio di file markdown nel filesystem remoto.
+
+## Caratteristiche
+- Lettura e scrittura streaming
+- Gestione di file di qualsiasi dimensione
+- API HTTP RESTful
+
+## Esempio di utilizzo
+\`\`\`bash
+mount -t fuse ./remote_fs /tmp/remote-fs
+\`\`\`
+`);
+
 const fileSystem: { [path: string]: INode } = {
   "/": {
     ino: 1,
@@ -43,7 +59,7 @@ const fileSystem: { [path: string]: INode } = {
   "/test.txt": {
     ino: 2,
     path: "/test.txt",
-    size: 70,
+    size: testContent.length,
     file_type: "RegularFile",
     permissions: 0o644,
     nlink: 1,
@@ -52,7 +68,7 @@ const fileSystem: { [path: string]: INode } = {
     atime: Math.floor(Date.now() / 1000),
     mtime: Math.floor(Date.now() / 1000),
     ctime: Math.floor(Date.now() / 1000),
-    blocks: 1,
+    blocks: Math.ceil(testContent.length / 512),
     blksize: 512
   },
   "/documents": {
@@ -73,7 +89,7 @@ const fileSystem: { [path: string]: INode } = {
   "/documents/readme.md": {
     ino: 4,
     path: "/documents/readme.md",
-    size: 256,
+    size: readmeContent.length,
     file_type: "RegularFile",
     permissions: 0o644,
     nlink: 1,
@@ -82,7 +98,7 @@ const fileSystem: { [path: string]: INode } = {
     atime: Math.floor(Date.now() / 1000),
     mtime: Math.floor(Date.now() / 1000),
     ctime: Math.floor(Date.now() / 1000),
-    blocks: 1,
+    blocks: 0,
     blksize: 512
   }
 };
@@ -239,6 +255,8 @@ app.post("/create", (req, res) => {
     blksize: 512
   };
   
+  // I file regolari avranno contenuto fisico sul server (non qui nei metadati)
+  
   // Aggiungi al mock filesystem
   fileSystem[path] = newFile;
   inodeToPath[newIno] = path;
@@ -357,11 +375,11 @@ app.post("/open", (req, res) => {
   });
 });
 
-// Read file content endpoint  
+// Read file content endpoint (unified for all file sizes)
 app.post('/read', (req, res) => {
   console.log('[READ] Received request:', JSON.stringify(req.body, null, 2));
   
-  const { path, file_handle, offset, size } = req.body;
+  const { path, file_handle, offset, size, chunk_index } = req.body;
 
   if (!path || file_handle === undefined) {
     console.error('[READ] Missing required parameters:', { path, file_handle });
@@ -379,16 +397,87 @@ app.post('/read', (req, res) => {
     return res.status(400).json({ error: 'Cannot read directory or special file' });
   }
 
-  const fileContent = Buffer.from(`Content of file: ${path}\nThis is line 2\nThis is line 3\nEnd of file.\n`);
+  const startOffset = Math.max(0, offset || 0);
   
-  const startOffset = Math.max(0, offset);
-  const endOffset = Math.min(fileContent.length, startOffset + size);
-  const data = fileContent.slice(startOffset, endOffset);
+  // Genera contenuto mock basato sui metadati del file
+  // In futuro questo sarà sostituito dalla lettura dal filesystem fisico
+  let mockContent = Buffer.from("Questo è il contenuto del file\nSeconda riga di esempio\n");
 
-  console.log(`[READ] Reading ${data.length} bytes from ${path} (offset: ${offset}, size: ${size})`);
-  
+  const actualSize = Math.min(mockContent.length, node.size);
+  const requestedSize = size || (actualSize - startOffset);
+  const endOffset = Math.min(actualSize, startOffset + requestedSize);
+  const bytesToRead = Math.max(0, endOffset - startOffset);
+
+  if (chunk_index !== undefined) {
+    console.log(`[READ] Chunk ${chunk_index}: ${bytesToRead} bytes from offset ${startOffset} (file size: ${actualSize}, mock)`);
+  } else {
+    console.log(`[READ] Reading ${bytesToRead} bytes from ${path} (offset: ${startOffset}, file size: ${actualSize}, mock)`);
+  }
+
+  const content = mockContent.subarray(startOffset, endOffset);
   res.set('Content-Type', 'application/octet-stream');
-  res.send(data);
+  res.send(content);
+
+});
+
+// Write file content endpoint (unified streaming for all file sizes)
+app.post('/write', (req, res) => {
+  console.log('[WRITE] Received streaming write request');
+  
+  const path = req.headers['x-path'] as string;
+  const file_handle = req.headers['x-file-handle'] as string;
+  const offset = parseInt(req.headers['x-offset'] as string);
+
+  if (!path || !file_handle || isNaN(offset)) {
+    console.error('[WRITE] Missing required headers:', { path, file_handle, offset });
+    return res.status(400).json({ error: 'Required headers: x-path, x-file-handle, x-offset' });
+  }
+
+  const node = fileSystem[path];
+  if (!node) {
+    console.error('[WRITE] File not found:', path);
+    return res.status(404).json({ error: 'File not found' });
+  }
+
+  if (node.file_type !== 'RegularFile') {
+    console.error('[WRITE] Cannot write to non-regular file:', path, 'type:', node.file_type);
+    return res.status(400).json({ error: 'Cannot write to directory or special file' });
+  }
+
+  const chunks: Buffer[] = [];
+  let totalBytesReceived = 0;
+  
+  req.on('data', (chunk: Buffer) => {
+    chunks.push(chunk);
+    totalBytesReceived += chunk.length;
+    
+    if (totalBytesReceived % (10 * 1024 * 1024) === 0) {
+      console.log(`[WRITE] Received ${Math.round(totalBytesReceived / 1024 / 1024)}MB for ${path}`);
+    }
+  });
+
+  req.on('end', () => {
+    const data = Buffer.concat(chunks);
+    const newSize = Math.max(node.size, offset + data.length);
+    
+    // Aggiorna metadati del file
+    node.size = newSize;
+    node.mtime = Math.floor(Date.now() / 1000);
+    node.blocks = Math.ceil(newSize / 512);
+
+    console.log(`[WRITE] Completed streaming write: ${data.length} bytes to ${path} at offset ${offset}, new size: ${newSize}`);
+    
+    res.json({ 
+      bytes_written: data.length,
+      new_size: newSize,
+      message: 'Streaming write successful'
+    });
+  });
+
+  req.on('error', (error) => {
+    console.error('[WRITE] Error during streaming write:', error);
+    res.status(500).json({ error: 'Error processing streaming file data' });
+  });
 });
 
 // List directory content endpoint
@@ -446,6 +535,77 @@ app.get('/listdir', (req, res) => {
   res.json({ entries });
 });
 
+// Endpoint per rinominare/spostare file e directory
+app.post('/rename', (req, res) => {
+  console.log('[RENAME] Received request:', JSON.stringify(req.body, null, 2));
+  
+  const { old_path, new_path } = req.body;
+  
+  if (!old_path || !new_path) {
+    console.error('[RENAME] Missing required parameters:', { old_path, new_path });
+    return res.status(400).json({ error: 'Both old_path and new_path are required' });
+  }
+
+  const sourceFile = fileSystem[old_path];
+  if (!sourceFile) {
+    console.error(`[RENAME] Source file not found: ${old_path}`);
+    return res.status(404).json({ error: 'Source file not found' });
+  }
+
+  if (fileSystem[new_path]) {
+    console.error(`[RENAME] Destination already exists: ${new_path}`);
+    return res.status(409).json({ error: 'Destination already exists' });
+  }
+
+  const newParentPath = new_path.substring(0, new_path.lastIndexOf('/')) || '/';
+  if (newParentPath !== '/' && !fileSystem[newParentPath]) {
+    console.error(`[RENAME] Parent directory not found: ${newParentPath}`);
+    return res.status(404).json({ error: 'Parent directory not found' });
+  }
+
+  if (sourceFile.file_type === 'Directory' && new_path.startsWith(old_path + '/')) {
+    console.error(`[RENAME] Cannot move directory into itself: ${old_path} -> ${new_path}`);
+    return res.status(400).json({ error: 'Cannot move directory into itself' });
+  }
+
+  const updatedFile = { ...sourceFile, path: new_path };
+  fileSystem[new_path] = updatedFile;
+  delete fileSystem[old_path];
+  
+  inodeToPath[sourceFile.ino] = new_path;
+
+  if (sourceFile.file_type === 'Directory') {
+    const childrenToMove = [];
+    for (const [path, node] of Object.entries(fileSystem)) {
+      if (path.startsWith(old_path + '/')) {
+        childrenToMove.push({ oldPath: path, node });
+      }
+    }
+    
+    for (const { oldPath, node } of childrenToMove) {
+      const newChildPath = new_path + oldPath.slice(old_path.length);
+      const updatedChild = { ...node, path: newChildPath };
+      fileSystem[newChildPath] = updatedChild;
+      delete fileSystem[oldPath];
+      inodeToPath[node.ino] = newChildPath;
+    }
+    
+    console.log(`[RENAME] Moved directory with ${childrenToMove.length} children`);
+  }
+
+  // Aggiorna timestamp
+  updatedFile.mtime = Math.floor(Date.now() / 1000);
+  updatedFile.ctime = updatedFile.mtime;
+
+  console.log(`[RENAME] Successfully moved: ${old_path} -> ${new_path}`);
+  res.json({ 
+    message: 'File renamed successfully',
+    old_path,
+    new_path,
+    metadata: updatedFile
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Server avviato su http://localhost:${PORT}`);
   console.log(`📁 Mock filesystem caricato con ${Object.keys(fileSystem).length} file`);
@@ -453,11 +613,14 @@ app.listen(PORT, () => {
   console.log(`   - GET /health - Health check`);
   console.log(`   - GET /resolve-inode/:ino - Risolve inode in path`);
   console.log(`   - GET /metadata?path=... - Ottiene metadati file`);
+  console.log(`   - PATCH /metadata?path=... - Aggiorna metadati file`);
   console.log(`   - POST /create - Crea nuovo file/directory`);
   console.log(`   - POST /open - Apre un file`);
-  console.log(`   - POST /read - Legge contenuto file`);
+  console.log(`   - POST /read - Legge contenuto file (unified streaming)`);
+  console.log(`   - POST /write - Scrive contenuto file (unified streaming)`);
   console.log(`   - GET /listdir?path=... - Lista contenuto directory`);
   console.log(`   - DELETE /remove?path=...&is_directory=... - Rimuove file/directory`);
+  console.log(`   - POST /rename - Rinomina/sposta file/directory`);
   console.log(`   - GET /debug/files - Lista tutti i file mock`);
 });
 
