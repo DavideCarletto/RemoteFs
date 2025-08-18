@@ -1,14 +1,16 @@
 import express from "express";
+import { SQLiteBackend } from "./sqlite-backend";
 
 process.on('uncaughtException', err => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', err => console.error('Unhandled Rejection:', err));
 
 const app = express();
 const PORT = 3000;
+const sqliteBackend = new SQLiteBackend("./data/fs.sqlite");
 
 app.use(express.json());
 
-interface INode {
+export interface INode {
   ino: number;
   path: string;
   size: number;
@@ -302,49 +304,26 @@ app.post('/files', (req, res) => {
     return res.status(404).json({ error: "Directory padre non trovata" });
   }
   
+  const name = path.split('/').pop() || path;
   // Genera nuovo inode
-  const newIno = Math.max(...Object.values(fileSystem).map(f => f.ino)) + 1;
+  //const newIno = Math.max(...Object.values(fileSystem).map(f => f.ino)) + 1;
+  let parent_ino = 1; //root  //bisogna implementare getinodeByPath
+  try {
+    const ino = sqliteBackend.createFile({
+      path,
+      parent_ino,
+      name,
+      mode,
+      uid,
+      gid
+    });
+     const metadata = sqliteBackend.getFileMetadataByIno(ino);
+    res.status(201).json(metadata);
+  } catch (err) {
+  const message = err instanceof Error ? err.message : String(err);
+  res.status(500).json({ error: "Errore creazione file", details: message });
+}
   
-  // Crea il nuovo file
-  const newFile: INode = {
-    ino: newIno,
-    path: path,
-    size: 0, // File vuoto
-    file_type: "RegularFile",
-    permissions: mode || 0o644,
-    nlink: 1,
-    uid: uid || 1000,
-    gid: gid || 1000,
-    atime: Math.floor(Date.now() / 1000),
-    mtime: Math.floor(Date.now() / 1000),
-    ctime: Math.floor(Date.now() / 1000),
-    blocks: 0,
-    blksize: 512
-  };
-  
-  // Aggiungi al filesystem
-  fileSystem[path] = newFile;
-  inodeToPath[newIno] = path;
-  
-  console.log(`✅ File creato: ${path} -> inode ${newIno}`);
-  
-  // Ritorna i metadati del file creato
-  res.status(201).json({
-    ino: newFile.ino,
-    size: newFile.size,
-    blocks: newFile.blocks,
-    atime: newFile.atime,
-    mtime: newFile.mtime,
-    ctime: newFile.ctime,
-    crtime: newFile.ctime,
-    file_type: newFile.file_type,
-    permissions: newFile.permissions,
-    nlink: newFile.nlink,
-    uid: newFile.uid,
-    gid: newFile.gid,
-    blksize: newFile.blksize,
-    flags: 0
-  });
 });
 
 // Endpoint mock per creare directory
