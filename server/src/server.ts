@@ -189,9 +189,16 @@ app.get('/files', (req, res) => {
 
   const startOffset = Math.max(0, offset || 0);
   
-  // Genera contenuto mock basato sui metadati del file
-  // In futuro questo sarà sostituito dalla lettura dal filesystem fisico
-  let mockContent = Buffer.from("Questo è il contenuto del file\nSeconda riga di esempio\n");
+  // Genera contenuto basato sul file specifico
+  let mockContent: Buffer;
+  if (path === '/test.txt') {
+    mockContent = testContent;
+  } else if (path === '/documents/readme.md') {
+    mockContent = readmeContent;
+  } else {
+    // Contenuto di default per altri file
+    mockContent = Buffer.from("Questo è il contenuto del file\nSeconda riga di esempio\n");
+  }
 
   const actualSize = Math.min(mockContent.length, node.size);
   const requestedSize = size || (actualSize - startOffset);

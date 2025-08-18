@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use log::{debug, info, warn};
+use log::{debug, info};
 use crate::filesystem::FileMetadata;
 
 #[derive(Clone)]
