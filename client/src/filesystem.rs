@@ -2,12 +2,13 @@ use fuser::{FileAttr, FileType, Filesystem};
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use serde_json::json;
 use std::time::{Duration, SystemTime};
 
 const MAX_NAME_LENGTH: u32 = 255;
 const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks per tutti i file
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct FileMetadata {
     ino: u64,
     size: u64,
@@ -181,9 +182,14 @@ impl RemoteFsClient {
         rdev: u32,
         umask: u32,
     ) -> Result<FileMetadata, i32> {
-        debug!("Creazione filesystem object: {} tipo: {}", path, file_type);
+        debug!("Creazione filesystem object: {} tipo: {} mode: {:o} uid: {} gid: {}", 
+            path, file_type, mode, uid, gid);
 
         let client = Client::new();
+        let current_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
 
         if file_type == "Directory" {
             // Per le directory usiamo POST /mkdir
@@ -195,7 +201,11 @@ impl RemoteFsClient {
                 "uid": uid,
                 "gid": gid,
                 "rdev": rdev,
-                "umask": umask
+                "umask": umask,
+                "atime": current_time,
+                "mtime": current_time,
+                "ctime": current_time,
+                "crtime": current_time
             });
 
             match client.post(&url).json(&request_data).send() {
@@ -240,14 +250,26 @@ impl RemoteFsClient {
         } else {
             // Per i file regolari usiamo POST /files
             let url = format!("{}/files", self.api_url);
+            let effective_mode = mode & !umask;  // Applica umask ai permessi
+            info!("Creazione file con permessi: {:o} (mode: {:o}, umask: {:o})", 
+                effective_mode, mode, umask);
+                
             let request_data = serde_json::json!({
                 "path": path,
                 "file_type": file_type,
-                "mode": mode,
+                "mode": effective_mode,
                 "uid": uid,
                 "gid": gid,
                 "rdev": rdev,
-                "umask": umask
+                "size": 0,
+                "permissions": effective_mode,
+                "atime": current_time,
+                "mtime": current_time,
+                "ctime": current_time,
+                "crtime": current_time,
+                "blocks": 0,
+                "blksize": 512,
+                "nlink": 1
             });
 
             match client.post(&url).json(&request_data).send() {
@@ -292,6 +314,12 @@ impl RemoteFsClient {
             path, is_directory
         );
 
+        // Verifica prima se il file esiste
+        if let None = self.get_file_metadata(path) {
+            error!("File non trovato per rimozione: {}", path);
+            return Err(libc::ENOENT);
+        }
+
         let client = Client::new();
         let url = format!("{}/files", self.api_url);
 
@@ -300,29 +328,52 @@ impl RemoteFsClient {
             .query(&[("path", path), ("is_directory", &is_directory.to_string())])
             .send()
         {
-            Ok(resp) if resp.status().is_success() => {
-                info!("Filesystem object rimosso: {}", path);
-                Ok(())
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                warn!("File non trovato per rimozione: {}", path);
-                Err(libc::ENOENT)
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
-                warn!("Permessi insufficienti per rimuovere: {}", path);
-                Err(libc::EACCES)
-            }
-            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
-                warn!("Directory non vuota o file in uso: {}", path);
-                Err(libc::ENOTEMPTY)
-            }
             Ok(resp) => {
-                error!("Errore server in rimozione per {}: {}", path, resp.status());
-                Err(libc::EIO)
+                match resp.status() {
+                    reqwest::StatusCode::OK => {
+                        info!("Filesystem object rimosso: {}", path);
+                        Ok(())
+                    }
+                    reqwest::StatusCode::NOT_FOUND => {
+                        warn!("File non trovato per rimozione: {}", path);
+                        Err(libc::ENOENT)
+                    }
+                    reqwest::StatusCode::FORBIDDEN => {
+                        warn!("Permessi insufficienti per rimuovere: {}", path);
+                        Err(libc::EACCES)
+                    }
+                    reqwest::StatusCode::CONFLICT => {
+                        // Distingui tra directory non vuota e file in uso
+                        if let Ok(response_text) = resp.text() {
+                            if response_text.contains("directory not empty") {
+                                warn!("Directory non vuota: {}", path);
+                                Err(libc::ENOTEMPTY)
+                            } else {
+                                warn!("File in uso: {}", path);
+                                Err(libc::EBUSY)
+                            }
+                        } else {
+                            warn!("Directory non vuota o file in uso: {}", path);
+                            Err(libc::ENOTEMPTY)
+                        }
+                    }
+                    _ => {
+                        error!("Errore server in rimozione per {}: {}", path, resp.status());
+                        Err(libc::EIO)
+                    }
+                }
             }
             Err(e) => {
-                error!("Errore di rete in rimozione per {}: {}", path, e);
-                Err(libc::EIO)
+                if e.is_timeout() {
+                    error!("Timeout durante la rimozione di {}: {}", path, e);
+                    Err(libc::ETIMEDOUT)
+                } else if e.is_connect() {
+                    error!("Errore di connessione durante la rimozione di {}: {}", path, e);
+                    Err(libc::ECONNREFUSED)
+                } else {
+                    error!("Errore di rete in rimozione per {}: {}", path, e);
+                    Err(libc::EIO)
+                }
             }
         }
     }
@@ -686,19 +737,40 @@ impl Filesystem for RemoteFsClient {
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
         let health_url = format!("{}/health", self.api_url);
+        info!("Tentativo di connessione al server: {}", health_url);
+        
         let client = Client::new();
         match client.get(&health_url).send() {
-            Ok(resp) if resp.status().is_success() => {
-                config.set_max_readahead(128 * 1024).ok();
-                config.set_max_write(128 * 1024).ok();
-                info!("Remote FS client initialized successfully.");
-                Ok(())
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    info!("Connessione al server stabilita con successo");
+                    match resp.text() {
+                        Ok(text) => info!("Risposta server: {}", text),
+                        Err(e) => warn!("Non è stato possibile leggere la risposta del server: {}", e)
+                    }
+                    config.set_max_readahead(128 * 1024).ok();
+                    config.set_max_write(128 * 1024).ok();
+                    info!("Remote FS client initialized successfully.");
+                    Ok(())
+                } else {
+                    error!(
+                        "Server ha risposto con status code non valido: {}",
+                        resp.status()
+                    );
+                    Err(libc::EIO)
+                }
             }
-            _ => {
+            Err(e) => {
                 error!(
-                    "Errore: impossibile raggiungere il server API all'URL {}",
-                    health_url
+                    "Errore durante la connessione al server {}: {}",
+                    health_url, e
                 );
+                if e.is_timeout() {
+                    error!("La connessione è andata in timeout");
+                }
+                if e.is_connect() {
+                    error!("Impossibile stabilire la connessione - verificare che il server sia in esecuzione e accessibile");
+                }
                 Err(libc::EIO)
             }
         }
@@ -779,9 +851,12 @@ impl Filesystem for RemoteFsClient {
             }
         };
 
+        info!("Recupero metadati per path: {}", path);
         match self.get_file_metadata(&path) {
             Some(metadata) => {
+                info!("Metadati trovati per {}: {:?}", path, metadata);
                 let file_attr = metadata.to_file_attr();
+                info!("FileAttr convertito: {:?}", file_attr);
                 reply.attr(&std::time::Duration::from_secs(1), &file_attr);
             }
             None => {
@@ -799,8 +874,8 @@ impl Filesystem for RemoteFsClient {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<std::time::SystemTime>,
@@ -817,13 +892,47 @@ impl Filesystem for RemoteFsClient {
             }
         };
 
-        let updates = serde_json::json!({
+        //da usare quando viene richiesto di impostare il tempo "now"
+        let current_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+
+        //logica per convertire i timestamp
+        let atime_secs = match atime {
+            Some(fuser::TimeOrNow::Now) => Some(current_time),
+            Some(fuser::TimeOrNow::SpecificTime(time)) => Some(
+                time.duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_secs(),
+            ),
+            None => None,
+        };
+
+        let mtime_secs = match mtime {
+            Some(fuser::TimeOrNow::Now) => Some(current_time),
+            Some(fuser::TimeOrNow::SpecificTime(time)) => Some(
+                time.duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_secs(),
+            ),
+            None => None,
+        };
+
+        let mut updates = serde_json::json!({
             "mode": mode,
             "uid": uid,
             "gid": gid,
             "size": size,
             "flags": flags,
         });
+
+        if let Some(atime) = atime_secs {
+            updates.as_object_mut().unwrap().insert("atime".to_string(), json!(atime));
+        }
+        if let Some(mtime) = mtime_secs {
+            updates.as_object_mut().unwrap().insert("mtime".to_string(), json!(mtime));
+        }
 
         match self.update_file_attributes(path.as_str(), updates.clone()) {
             Some(metadata) => {
@@ -1283,6 +1392,23 @@ impl Filesystem for RemoteFsClient {
             }
         };
 
+        // Prima verifica che la directory esista
+        match self.get_file_metadata(&path) {
+            Some(metadata) if metadata.file_type == fuser::FileType::Directory => {
+                // Directory esiste, procedi
+            },
+            Some(_) => {
+                error!("Path {} non è una directory", path);
+                reply.error(libc::ENOTDIR);
+                return;
+            },
+            None => {
+                error!("Directory {} non trovata", path);
+                reply.error(libc::ENOENT);
+                return;
+            }
+        }
+
         let entries = match self.list_directory(&path) {
             Ok(entries) => entries,
             Err(error_code) => {
@@ -1296,20 +1422,25 @@ impl Filesystem for RemoteFsClient {
             ("..".to_string(), 1, fuser::FileType::Directory),
         ];
 
+        info!("Processando {} entries da list_directory", entries.len());
+
+        // Aggiungi tutte le entries trovate
         for (name, entry_ino, file_type) in entries {
+            info!("Aggiungendo entry: {} (ino: {}, type: {:?})", name, entry_ino, file_type);
             full_entries.push((name, entry_ino, file_type));
         }
 
         for (i, (name, entry_ino, file_type)) in
             full_entries.iter().enumerate().skip(offset as usize)
         {
+            info!("Sending to FUSE: {} (ino: {}, type: {:?})", name, entry_ino, file_type);
             if reply.add(*entry_ino, (i + 1) as i64, *file_type, name.as_str()) {
                 break;
             }
         }
 
         info!(
-            "Readdir completato per {}: {} entries",
+            "Readdir completato per {}: {} entries valide",
             path,
             full_entries.len()
         );
@@ -1454,7 +1585,18 @@ impl Filesystem for RemoteFsClient {
 
         // Crea il file (sempre RegularFile per create)
         let file_type = "RegularFile";
-        let permissions = mode & !libc::S_IFMT;
+        let effective_flags = flags | libc::O_WRONLY;  // Assicura che il file sia aperto in scrittura
+        let effective_mode = (mode & !umask) | libc::S_IFREG;  // Applica umask e forza tipo regular file
+        let permissions = effective_mode & !libc::S_IFMT; // Estrai solo i permessi
+
+        info!("Creazione file: {} con permessi {:o}", full_path, permissions);
+
+        // Prima verifica se il file esiste già
+        if let Some(_) = self.get_file_metadata(&full_path) {
+            error!("File già esistente: {}", full_path);
+            reply.error(libc::EEXIST);
+            return;
+        }
 
         match self.create_filesystem_object(
             &full_path,
@@ -1467,12 +1609,12 @@ impl Filesystem for RemoteFsClient {
         ) {
             Ok(metadata) => {
                 // File creato con successo, ora aprilo
-                match self.open_file(&full_path, flags) {
+                match self.open_file(&full_path, effective_flags) {
                     Ok(file_handle) => {
                         let file_attr = metadata.to_file_attr();
                         info!(
-                            "File created and opened: {} -> fh {}",
-                            full_path, file_handle
+                            "File created and opened: {} -> fh {} with flags {:#x}",
+                            full_path, file_handle, effective_flags
                         );
                         reply.created(
                             &std::time::Duration::from_secs(1),
