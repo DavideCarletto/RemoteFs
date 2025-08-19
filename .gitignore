@@ -13,3 +13,6 @@
 *.sqlite
 *.sqlite3
 *.db
+
+# Filesystem storage
+/server/fs/

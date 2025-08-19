@@ -11,12 +11,18 @@ export interface FileHandle {
 
 export class SQLiteBackend {
   private db: Database.Database;
-  private openFiles: Map<number, FileHandle>;  //classe mantiene una mappa dei file aperti
+  private openFiles: Map<number, FileHandle>;
+  private filesystemDir: string;
 
   constructor(dbPath: string) {
     const dbDir = path.dirname(dbPath);
     if (!fs.existsSync(dbDir)) {
       fs.mkdirSync(dbDir, { recursive: true });
+    }
+    
+    this.filesystemDir = path.resolve(dbDir, '../fs');
+    if (!fs.existsSync(this.filesystemDir)) {
+      fs.mkdirSync(this.filesystemDir, { recursive: true });
     }
     
     this.db = new Database(dbPath);
@@ -47,26 +53,11 @@ export class SQLiteBackend {
             CREATE INDEX IF NOT EXISTS idx_fs_nodes_path ON fs_nodes(path);
             CREATE INDEX IF NOT EXISTS idx_fs_nodes_parent ON fs_nodes(parent_ino);
             CREATE INDEX IF NOT EXISTS idx_fs_nodes_name ON fs_nodes(name);
-
-            CREATE TABLE IF NOT EXISTS fs_content (
-                ino INTEGER PRIMARY KEY REFERENCES fs_nodes(ino) ON DELETE CASCADE,
-                content BLOB NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS fs_chunks (
-                ino INTEGER REFERENCES fs_nodes(ino) ON DELETE CASCADE,
-                chunk_index INTEGER NOT NULL,
-                chunk_size INTEGER NOT NULL,
-                chunk_data BLOB NOT NULL,
-                created_at INTEGER DEFAULT (strftime('%s','now')),
-                PRIMARY KEY (ino, chunk_index)
-            );
         `);
   }
 
   //crea struttura base del filesystem (directory root (/), file test.txt di esempio e directory documents)
   initializeDefaultFiles() {
-  // Crea la directory root se non esiste
   const rootStmt = this.db.prepare(`
     INSERT OR IGNORE INTO fs_nodes (
       ino, path, parent_ino, name, file_type, size, permissions, uid, gid,
@@ -79,7 +70,6 @@ export class SQLiteBackend {
   `);
   rootStmt.run();
 
-  // Crea test.txt di default
   const testFileStmt = this.db.prepare(`
     INSERT OR IGNORE INTO fs_nodes (
       ino, path, parent_ino, name, file_type, size, permissions, uid, gid,
@@ -93,7 +83,12 @@ export class SQLiteBackend {
   const testContent = Buffer.from("Questo è il contenuto del file test.txt\nSeconda riga di esempio\n");
   testFileStmt.run(testContent.length, Math.ceil(testContent.length / 512));
 
-  // Crea la directory documents
+  // Crea il file fisico per test.txt
+  const testFilePath = `${this.filesystemDir}/2`;
+  if (!fs.existsSync(testFilePath)) {
+    fs.writeFileSync(testFilePath, testContent);
+  }
+
   const documentsStmt = this.db.prepare(`
     INSERT OR IGNORE INTO fs_nodes (
       ino, path, parent_ino, name, file_type, size, permissions, uid, gid,
@@ -155,7 +150,6 @@ export class SQLiteBackend {
   listDirectory(path: string): Array<{ ino: number; name: string; file_type: string }> {
     let entries: Array<{ ino: number; name: string; file_type: string }> = [];
     
-    // Ottieni l'inode della directory
     const dirIno = path === '/' ? 1 : this.getInodeByPath(path);
     
     if (dirIno !== undefined) {
@@ -218,7 +212,6 @@ export class SQLiteBackend {
   deleteNode(path: string, isDirectory?: boolean): { success: boolean; error?: string } {
     console.log(`[DELETE] Tentativo di rimozione: ${path} (isDirectory: ${isDirectory})`);
     
-    // Verifica se il nodo esiste
     const checkStmt = this.db.prepare('SELECT ino, file_type FROM fs_nodes WHERE path = ?');
     const node = checkStmt.get(path) as { ino: number; file_type: string } | undefined;
     
@@ -227,7 +220,6 @@ export class SQLiteBackend {
       return { success: false, error: 'no_such_file_or_directory' };
     }
 
-    // Controlla che il tipo di file sia corretto se specificato
     if (isDirectory !== undefined) {
       if (isDirectory && node.file_type !== 'Directory') {
         return { success: false, error: 'not_a_directory' };
@@ -237,7 +229,6 @@ export class SQLiteBackend {
       }
     }
 
-    // Se è una directory, verifica che sia vuota
     if (node.file_type === 'Directory') {
       const checkEmptyStmt = this.db.prepare('SELECT COUNT(*) as count FROM fs_nodes WHERE parent_ino = ?');
       const result = checkEmptyStmt.get(node.ino) as { count: number };
@@ -249,15 +240,13 @@ export class SQLiteBackend {
 
     try {
       this.db.transaction(() => {
-        // Rimuovi prima il contenuto del file se esiste
-        const contentStmt = this.db.prepare('DELETE FROM fs_content WHERE ino = ?');
-        contentStmt.run(node.ino);
+        if (node.file_type === 'RegularFile') {
+          const filePath = `${this.filesystemDir}/${node.ino}`;
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+          }
+        }
 
-        // Rimuovi eventuali chunks
-        const chunksStmt = this.db.prepare('DELETE FROM fs_chunks WHERE ino = ?');
-        chunksStmt.run(node.ino);
-
-        // Rimuovi il nodo
         const nodeStmt = this.db.prepare('DELETE FROM fs_nodes WHERE ino = ?');
         nodeStmt.run(node.ino);
       })();
@@ -281,58 +270,76 @@ export class SQLiteBackend {
     return handle;
   }
 
-  readFile(path: string, offset: number, size: number): Buffer {
-    const stmt = this.db.prepare('SELECT content FROM fs_content WHERE ino = (SELECT ino FROM fs_nodes WHERE path = ?)');
-    const result = stmt.get(path) as { content: Buffer } | undefined;
+  // Streaming di lettura
+  readFile(path: string, options?: { start?: number; end?: number }): fs.ReadStream | null {
+    const stmt = this.db.prepare('SELECT ino FROM fs_nodes WHERE path = ?');
+    const result = stmt.get(path) as { ino: number } | undefined;
     
     if (!result) {
-      return Buffer.alloc(0);
+      return null;
     }
 
-    return result.content.subarray(offset, offset + size);
+    const filePath = `${this.filesystemDir}/${result.ino}`;
+    
+    try {
+      if (!fs.existsSync(filePath)) {
+        return null;
+      }
+      
+      return fs.createReadStream(filePath, options);
+    } catch (error) {
+      console.error(`[FS] Error creating read stream for ${filePath}:`, error);
+      return null;
+    }
   }
 
-  writeFile(path: string, data: Buffer, offset: number): number {
-    const nodeStmt = this.db.prepare('SELECT ino, size FROM fs_nodes WHERE path = ?');
-    const node = nodeStmt.get(path) as { ino: number; size: number };
-
-    if (!node) {
-      throw new Error('File not found');
-    }
-
-    const contentStmt = this.db.prepare(`
-      INSERT OR REPLACE INTO fs_content (ino, content)
-      VALUES (?, ?)
-    `);
-
-    // If this is the first write, or we're writing at offset 0
-    if (offset === 0) {
-      contentStmt.run(node.ino, data);
-    } else {
-      // For appending or writing at an offset, we need to read existing content
-      const existingContent = this.readFile(path, 0, node.size);
-      const newSize = Math.max(existingContent.length, offset + data.length);
-      const newContent = Buffer.alloc(newSize);
-      
-      existingContent.copy(newContent, 0);
-      data.copy(newContent, offset);
-      contentStmt.run(node.ino, newContent);
-    }
-
-    // Update file size and timestamps
-    const updateStmt = this.db.prepare(`
-      UPDATE fs_nodes 
-      SET size = ?, 
-          mtime = ?,
-          blocks = ?
-      WHERE ino = ?
-    `);
+  // Streaming di scrittura
+  writeFile(path: string, options?: { start?: number }): fs.WriteStream | null {
+    const stmt = this.db.prepare('SELECT ino FROM fs_nodes WHERE path = ?');
+    const result = stmt.get(path) as { ino: number } | undefined;
     
-    const newSize = Math.max(node.size, offset + data.length);
-    const now = Math.floor(Date.now() / 1000);
-    updateStmt.run(newSize, now, Math.ceil(newSize / 512), node.ino);
+    if (!result) {
+      return null;
+    }
 
-    return data.length;
+    const filePath = `${this.filesystemDir}/${result.ino}`;
+    
+    try {
+      return fs.createWriteStream(filePath, options);
+    } catch (error) {
+      console.error(`[FS] Error creating write stream for ${filePath}:`, error);
+      return null;
+    }
+  }
+
+  // Aggiorna dimensione file dopo streaming
+  updateFileSize(path: string): void {
+    const stmt = this.db.prepare('SELECT ino FROM fs_nodes WHERE path = ?');
+    const result = stmt.get(path) as { ino: number } | undefined;
+    
+    if (!result) {
+      return;
+    }
+
+    const filePath = `${this.filesystemDir}/${result.ino}`;
+    
+    try {
+      if (fs.existsSync(filePath)) {
+        const stats = fs.statSync(filePath);
+        const updateStmt = this.db.prepare(`
+          UPDATE fs_nodes 
+          SET size = ?, 
+              mtime = ?,
+              blocks = ?
+          WHERE ino = ?
+        `);
+        
+        const now = Math.floor(Date.now() / 1000);
+        updateStmt.run(stats.size, now, Math.ceil(stats.size / 512), result.ino);
+      }
+    } catch (error) {
+      console.error(`[FS] Error updating file size for ${filePath}:`, error);
+    }
   }
 
   //rinomina/sposta file e directory
@@ -345,7 +352,6 @@ export class SQLiteBackend {
     }
 
     this.db.transaction(() => {
-      // Update the main node
       const updateStmt = this.db.prepare(`
         UPDATE fs_nodes 
         SET path = ?,
@@ -359,7 +365,6 @@ export class SQLiteBackend {
       const newName = newPath.split('/').pop() || '';
       updateStmt.run(newPath, newName, now, now, node.ino);
 
-      // Update all child paths if it's a directory
       const updateChildrenStmt = this.db.prepare(`
         UPDATE fs_nodes 
         SET path = replace(path, ?, ?)
@@ -403,7 +408,6 @@ export class SQLiteBackend {
       setFields.push('blocks = @blocks');
     }
 
-    // Gestione esplicita dei timestamp
     if (updates.atime !== undefined) {
       setFields.push('atime = @atime');
       params.atime = updates.atime;
@@ -422,7 +426,6 @@ export class SQLiteBackend {
     }
 
     if (setFields.length > 0) {
-      // Se non sono stati forniti timestamp specifici, aggiorna mtime
       if (!updates.mtime) {
         setFields.push('mtime = @now');
         params.now = Math.floor(Date.now() / 1000);

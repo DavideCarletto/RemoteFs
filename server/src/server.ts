@@ -62,7 +62,7 @@ app.get('/list', (req, res) => {
   }
 });
 
-// Read file content endpoint (unified for all file sizes)
+// Read file content endpoint
 app.get('/files', (req, res) => {
   console.log('[READ] Received request:', JSON.stringify(req.body, null, 2));
   
@@ -88,23 +88,44 @@ app.get('/files', (req, res) => {
     const startOffset = Math.max(0, offset || 0);
     const requestedSize = size || (metadata.size - startOffset);
     
-    const content = sqliteBackend.readFile(path, startOffset, requestedSize);
+    // Calcola la dimensione effettiva da leggere (non può essere più grande del file)
+    const actualEndOffset = Math.min(startOffset + requestedSize - 1, metadata.size - 1);
+    const actualSize = Math.max(0, actualEndOffset - startOffset + 1);
     
-    if (chunk_index !== undefined) {
-      console.log(`[READ] Chunk ${chunk_index}: ${content.length} bytes from offset ${startOffset} (file size: ${metadata.size})`);
-    } else {
-      console.log(`[READ] Reading ${content.length} bytes from ${path} (offset: ${startOffset}, file size: ${metadata.size})`);
+    console.log(`[READ] Streaming ${actualSize} bytes from ${path} (offset: ${startOffset}, file size: ${metadata.size})`);
+    
+    const readStream = sqliteBackend.readFile(path, { 
+      start: startOffset, 
+      end: actualEndOffset
+    });
+    
+    if (!readStream) {
+      console.error('[READ] Failed to create read stream for:', path);
+      return res.status(500).json({ error: 'Failed to create read stream' });
     }
 
     res.set('Content-Type', 'application/octet-stream');
-    res.send(content);
+    res.set('Content-Length', actualSize.toString());
+    
+    readStream.on('error', (error: Error) => {
+      console.error('[READ] Stream error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream error' });
+      }
+    });
+
+    if (chunk_index !== undefined) {
+      console.log(`[READ] Streaming chunk ${chunk_index}: ${actualSize} bytes from offset ${startOffset}`);
+    }
+
+    readStream.pipe(res);
   } catch (err) {
     console.error('[READ] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Write file content endpoint (unified streaming for all file sizes)
+// Write file content endpoint
 app.put('/files', (req, res) => {
   console.log('[WRITE] Received streaming write request');
   
@@ -129,41 +150,62 @@ app.put('/files', (req, res) => {
       return res.status(400).json({ error: 'Cannot write to directory or special file' });
     }
 
-    const chunks: Buffer[] = [];
-    let totalBytesReceived = 0;
+    console.log(`[WRITE] Streaming write to ${path} at offset ${offset}`);
     
-    req.on('data', (chunk: Buffer) => {
-      chunks.push(chunk);
-      totalBytesReceived += chunk.length;
-      
-      if (totalBytesReceived % (10 * 1024 * 1024) === 0) {
-        console.log(`[WRITE] Received ${Math.round(totalBytesReceived / 1024 / 1024)}MB for ${path}`);
+    const writeStream = sqliteBackend.writeFile(path, { start: offset });
+    if (!writeStream) {
+      console.error('[WRITE] Failed to create write stream for:', path);
+      return res.status(500).json({ error: 'Failed to create write stream' });
+    }
+
+    let totalBytesWritten = 0;
+
+    writeStream.on('error', (error) => {
+      console.error('[WRITE] Stream error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Stream write error' });
       }
     });
 
-    req.on('end', () => {
-      const data = Buffer.concat(chunks);
+    writeStream.on('finish', () => {
       try {
-        const bytesWritten = sqliteBackend.writeFile(path, data, offset);
+        // Aggiorna i metadati del file dopo la scrittura
+        sqliteBackend.updateFileSize(path);
         const updatedMetadata = sqliteBackend.getFileMetadataByPath(path);
         
-        console.log(`[WRITE] Completed streaming write: ${bytesWritten} bytes to ${path} at offset ${offset}, new size: ${updatedMetadata?.size}`);
+        console.log(`[WRITE] Completed streaming write: ${totalBytesWritten} bytes to ${path} at offset ${offset}, new size: ${updatedMetadata?.size}`);
         
-        res.json({ 
-          bytes_written: bytesWritten,
-          new_size: updatedMetadata?.size,
-          message: 'Streaming write successful'
-        });
+        if (!res.headersSent) {
+          res.json({ 
+            bytes_written: totalBytesWritten,
+            new_size: updatedMetadata?.size,
+            message: 'Streaming write successful'
+          });
+        }
       } catch (err) {
-        console.error('[WRITE] Error writing file:', err);
-        res.status(500).json({ error: 'Error writing file data' });
+        console.error('[WRITE] Error updating metadata after stream:', err);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Error updating file metadata' });
+        }
+      }
+    });
+
+    req.on('data', (chunk: Buffer) => {
+      totalBytesWritten += chunk.length;
+      
+      if (totalBytesWritten % (10 * 1024 * 1024) === 0) {
+        console.log(`[WRITE] Streamed ${Math.round(totalBytesWritten / 1024 / 1024)}MB for ${path}`);
       }
     });
 
     req.on('error', (error) => {
-      console.error('[WRITE] Error during streaming write:', error);
-      res.status(500).json({ error: 'Error processing streaming file data' });
+      console.error('[WRITE] Error during write request:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Error processing file data' });
+      }
     });
+
+    req.pipe(writeStream);
   } catch (err) {
     console.error('[WRITE] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
