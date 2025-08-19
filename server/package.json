@@ -2,6 +2,10 @@
   "name": "server",
   "version": "1.0.0",
   "main": "index.js",
+  "engines": {
+    "node": ">=14.21.1",
+    "npm": ">=6.0.0"
+  },
   "scripts": {
     "test": "jest",
     "test:watch": "jest --watch",
