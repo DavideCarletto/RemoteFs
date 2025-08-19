@@ -28,7 +28,10 @@ impl CachedMetadata {
 pub struct DirectoryEntry {
     pub name: String,
     pub ino: u64,
+    #[cfg(target_os = "linux")]
     pub file_type: fuser::FileType,
+    #[cfg(target_os = "windows")]
+    pub file_type: String,
 }
 
 #[derive(Clone)]
@@ -268,7 +271,19 @@ impl FileSystemCache {
         None
     }
 
+    #[cfg(target_os = "linux")]
     pub fn cache_directory_entries(&mut self, path: String, entries: Vec<(String, u64, fuser::FileType)>) {
+        let cached_entries: Vec<DirectoryEntry> = entries.into_iter()
+            .map(|(name, ino, file_type)| DirectoryEntry { name, ino, file_type })
+            .collect();
+        
+        let cached_dir = CachedDirectory::new(cached_entries, self.config.directory_ttl);
+        debug!("Cache STORE: directory {} ({} entries)", path, cached_dir.entries.len());
+        self.directories.insert(path, cached_dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn cache_directory_entries(&mut self, path: String, entries: Vec<(String, u64, String)>) {
         let cached_entries: Vec<DirectoryEntry> = entries.into_iter()
             .map(|(name, ino, file_type)| DirectoryEntry { name, ino, file_type })
             .collect();
