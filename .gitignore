@@ -7,3 +7,9 @@
 /server/node_modules/
 /server/dist/
 /server/.env
+
+# Database files
+/server/data/
+*.sqlite
+*.sqlite3
+*.db

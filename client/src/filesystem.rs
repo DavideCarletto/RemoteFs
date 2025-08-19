@@ -1,8 +1,8 @@
-use fuser::{FileAttr, FileType, Filesystem};
+use crate::types::FileMetadata;
+use fuser::Filesystem;
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
-use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json};
 use std::time::{Duration, SystemTime};
 
 //per caching
@@ -15,46 +15,6 @@ use std::thread;
 
 const MAX_NAME_LENGTH: u32 = 255;
 const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks per tutti i file
-
-#[derive(Deserialize, Debug)]
-struct FileMetadata {
-    ino: u64,
-    size: u64,
-    blocks: u64,
-    atime: u64,
-    mtime: u64,
-    ctime: u64,
-    crtime: Option<u64>,
-    file_type: FileType,
-    permissions: u16,
-    nlink: u32,
-    uid: u32,
-    gid: u32,
-    blksize: u32,
-    flags: Option<u32>,
-}
-
-impl FileMetadata {
-    fn to_file_attr(&self) -> FileAttr {
-        FileAttr {
-            ino: self.ino,
-            size: self.size,
-            blocks: self.blocks,
-            atime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.atime),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.mtime),
-            ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.ctime),
-            crtime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.crtime.unwrap_or(self.ctime)),
-            kind: self.file_type,
-            perm: self.permissions,
-            nlink: self.nlink,
-            uid: self.uid,
-            gid: self.gid,
-            rdev: 0,
-            blksize: self.blksize,
-            flags: self.flags.unwrap_or(0),
-        }
-    }
-}
 
 pub struct RemoteFsClient {
     api_url: String,
@@ -180,8 +140,6 @@ impl RemoteFsClient {
         match client.get(&url).send() {
             Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
                 Ok(metadata) => {
-                    info!("Metadati ricevuti per {}: inode {}", path, metadata.ino);
-
                     //salva in cache solo se abilitata
                     #[cfg(feature = "cache")]
                     if let Ok(mut cache) = self.cache.lock() {
@@ -253,8 +211,10 @@ impl RemoteFsClient {
         rdev: u32,
         umask: u32,
     ) -> Result<FileMetadata, i32> {
-        debug!("Creazione filesystem object: {} tipo: {} mode: {:o} uid: {} gid: {}", 
-            path, file_type, mode, uid, gid);
+        debug!(
+            "Creazione filesystem object: {} tipo: {} mode: {:o} uid: {} gid: {}",
+            path, file_type, mode, uid, gid
+        );
 
         let client = Client::new();
         let current_time = SystemTime::now()
@@ -282,7 +242,6 @@ impl RemoteFsClient {
             match client.post(&url).json(&request_data).send() {
                 Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
                     Ok(metadata) => {
-                        info!("Directory creata: {} -> inode {}", path, metadata.ino);
                         Ok(metadata)
                     }
                     Err(e) => {
@@ -321,10 +280,8 @@ impl RemoteFsClient {
         } else {
             // Per i file regolari usiamo POST /files
             let url = format!("{}/files", self.api_url);
-            let effective_mode = mode & !umask;  // Applica umask ai permessi
-            info!("Creazione file con permessi: {:o} (mode: {:o}, umask: {:o})", 
-                effective_mode, mode, umask);
-                
+            let effective_mode = mode & !umask;
+           
             let request_data = serde_json::json!({
                 "path": path,
                 "file_type": file_type,
@@ -346,7 +303,6 @@ impl RemoteFsClient {
             match client.post(&url).json(&request_data).send() {
                 Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
                     Ok(metadata) => {
-                        info!("File creato: {} -> inode {}", path, metadata.ino);
                         Ok(metadata)
                     }
                     Err(e) => {
@@ -439,7 +395,10 @@ impl RemoteFsClient {
                     error!("Timeout durante la rimozione di {}: {}", path, e);
                     Err(libc::ETIMEDOUT)
                 } else if e.is_connect() {
-                    error!("Errore di connessione durante la rimozione di {}: {}", path, e);
+                    error!(
+                        "Errore di connessione durante la rimozione di {}: {}",
+                        path, e
+                    );
                     Err(libc::ECONNREFUSED)
                 } else {
                     error!("Errore di rete in rimozione per {}: {}", path, e);
@@ -530,7 +489,7 @@ impl RemoteFsClient {
         let mut remaining_size = size;
         let mut chunk_index = 0;
 
-        info!(
+        debug!(
             "Inizio lettura streaming: offset={}, size={} bytes, chunk_size={}KB",
             offset,
             size,
@@ -566,7 +525,7 @@ impl RemoteFsClient {
 
                         if chunk_index % 100 == 0 {
                             let progress = ((size - remaining_size) as f64 / size as f64) * 100.0;
-                            info!(
+                            debug!(
                                 "Progresso lettura streaming: {:.1}% ({}/{} bytes)",
                                 progress,
                                 size - remaining_size,
@@ -659,8 +618,7 @@ impl RemoteFsClient {
                                 }
                             }
 
-                            info!("Directory {} contiene {} elementi", path, result.len());
-
+                            info!("Directory {} elencata: {} entries", path, result.len());
                             //salva in cache solo se abilitata
                             #[cfg(feature = "cache")]
                             if let Ok(mut cache) = self.cache.lock() {
@@ -753,32 +711,18 @@ impl RemoteFsClient {
         data: &[u8],
     ) -> Result<u32, i32> {
         debug!(
-            "Scrittura file in streaming: {} (fh: {}, offset: {}, size: {})",
+            "Scrittura file: {} (offset: {}, size: {}KB)",
             path,
-            file_handle,
             offset,
-            data.len()
+            data.len() / 1024
         );
 
         let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
         let total_chunks = chunks.len();
         let mut total_written = 0u32;
 
-        info!(
-            "Inizio scrittura streaming: {} chunks da {}KB ciascuno",
-            total_chunks,
-            CHUNK_SIZE / 1024
-        );
-
         for (chunk_index, chunk) in chunks.iter().enumerate() {
             let chunk_offset = offset + (chunk_index * CHUNK_SIZE) as i64;
-
-            debug!(
-                "Scrittura chunk {}/{} ({}KB)",
-                chunk_index + 1,
-                total_chunks,
-                chunk.len() / 1024
-            );
 
             let client = Client::new();
 
@@ -805,7 +749,7 @@ impl RemoteFsClient {
                                 if chunk_index % 50 == 0 && total_chunks > 1 {
                                     let progress =
                                         ((chunk_index + 1) as f32 / total_chunks as f32) * 100.0;
-                                    info!(
+                                    debug!(
                                         "Chunk {}/{} completato - Progresso: {:.1}%",
                                         chunk_index + 1,
                                         total_chunks,
@@ -877,40 +821,19 @@ impl Filesystem for RemoteFsClient {
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
         let health_url = format!("{}/health", self.api_url);
-        info!("Tentativo di connessione al server: {}", health_url);
-        
         let client = Client::new();
         match client.get(&health_url).send() {
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    info!("Connessione al server stabilita con successo");
-                    match resp.text() {
-                        Ok(text) => info!("Risposta server: {}", text),
-                        Err(e) => warn!("Non è stato possibile leggere la risposta del server: {}", e)
-                    }
-                    config.set_max_readahead(128 * 1024).ok();
-                    config.set_max_write(128 * 1024).ok();
-                    info!("Remote FS client initialized successfully.");
-                    Ok(())
-                } else {
-                    error!(
-                        "Server ha risposto con status code non valido: {}",
-                        resp.status()
-                    );
-                    Err(libc::EIO)
-                }
+            Ok(resp) if resp.status().is_success() => {
+                config.set_max_readahead(128 * 1024).ok();
+                config.set_max_write(128 * 1024).ok();
+                info!("Remote FS client initialized successfully.");
+                Ok(())
             }
-            Err(e) => {
+            _ => {
                 error!(
-                    "Errore durante la connessione al server {}: {}",
-                    health_url, e
+                    "Errore: impossibile raggiungere il server API all'URL {}",
+                    health_url
                 );
-                if e.is_timeout() {
-                    error!("La connessione è andata in timeout");
-                }
-                if e.is_connect() {
-                    error!("Impossibile stabilire la connessione - verificare che il server sia in esecuzione e accessibile");
-                }
                 Err(libc::EIO)
             }
         }
@@ -936,8 +859,6 @@ impl Filesystem for RemoteFsClient {
         name: &std::ffi::OsStr,
         reply: fuser::ReplyEntry,
     ) {
-        debug!("lookup(parent: {}, name: {:?})", parent, name);
-
         if name.len() > MAX_NAME_LENGTH as usize {
             reply.error(libc::ENAMETOOLONG);
             return;
@@ -988,8 +909,6 @@ impl Filesystem for RemoteFsClient {
         _fh: Option<u64>,
         reply: fuser::ReplyAttr,
     ) {
-        debug!("getattr(ino: {:#x?} )", ino);
-
         let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
@@ -999,16 +918,12 @@ impl Filesystem for RemoteFsClient {
             }
         };
 
-        info!("Recupero metadati per path: {}", path);
         match self.get_file_metadata(&path) {
             Some(metadata) => {
-                info!("Metadati trovati per {}: {:?}", path, metadata);
                 let file_attr = metadata.to_file_attr();
-                info!("FileAttr convertito: {:?}", file_attr);
                 reply.attr(&std::time::Duration::from_secs(1), &file_attr);
             }
             None => {
-                warn!("File non trovato: {}", path);
                 reply.error(libc::ENOENT);
             }
         }
@@ -1067,22 +982,34 @@ impl Filesystem for RemoteFsClient {
             None => None,
         };
 
-        let mut updates = serde_json::json!({
-            "mode": mode,
-            "uid": uid,
-            "gid": gid,
-            "size": size,
-            "flags": flags,
-        });
+        let mut updates = serde_json::Map::new();
+
+        if let Some(mode) = mode {
+            updates.insert("mode".to_string(), json!(mode));
+        }
+        if let Some(uid) = uid {
+            updates.insert("uid".to_string(), json!(uid));
+        }
+        if let Some(gid) = gid {
+            updates.insert("gid".to_string(), json!(gid));
+        }
+        if let Some(size) = size {
+            updates.insert("size".to_string(), json!(size));
+        }
+        if let Some(flags) = flags {
+            updates.insert("flags".to_string(), json!(flags));
+        }
 
         if let Some(atime) = atime_secs {
-            updates.as_object_mut().unwrap().insert("atime".to_string(), json!(atime));
+            updates.insert("atime".to_string(), json!(atime));
         }
         if let Some(mtime) = mtime_secs {
-            updates.as_object_mut().unwrap().insert("mtime".to_string(), json!(mtime));
+            updates.insert("mtime".to_string(), json!(mtime));
         }
 
-        match self.update_file_attributes(path.as_str(), updates.clone()) {
+        let updates_json = serde_json::Value::Object(updates);
+
+        match self.update_file_attributes(path.as_str(), updates_json.clone()) {
             Some(metadata) => {
                 let file_attr = metadata.to_file_attr();
 
@@ -1092,7 +1019,7 @@ impl Filesystem for RemoteFsClient {
                 reply.attr(&std::time::Duration::from_secs(1), &file_attr);
             }
             None => {
-                debug!("Impossibile aggiornare attributi per {}: {}", path, updates);
+                debug!("Impossibile aggiornare attributi per {}: {}", path, updates_json);
                 reply.error(libc::ENOENT);
             }
         }
@@ -1188,11 +1115,6 @@ impl Filesystem for RemoteFsClient {
         umask: u32,
         reply: fuser::ReplyEntry,
     ) {
-        debug!(
-            "mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
-            parent, name, mode, umask
-        );
-
         if name.len() > MAX_NAME_LENGTH as usize {
             reply.error(libc::ENAMETOOLONG);
             return;
@@ -1338,7 +1260,7 @@ impl Filesystem for RemoteFsClient {
                 if let Some(parent_path) = self.inode_to_path(parent) {
                     self.invalidate_cache_for_directory(&parent_path);
                 }
-                
+
                 reply.ok();
             }
             Err(error_code) => {
@@ -1465,15 +1387,10 @@ impl Filesystem for RemoteFsClient {
         fh: u64,
         offset: i64,
         size: u32,
-        flags: i32,
-        lock_owner: Option<u64>,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        debug!(
-            "read(ino: {:#x}, fh: {}, offset: {}, size: {}, flags: {:#x}, lock_owner: {:?})",
-            ino, fh, offset, size, flags, lock_owner
-        );
-
         let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
@@ -1503,22 +1420,11 @@ impl Filesystem for RemoteFsClient {
         fh: u64,
         offset: i64,
         data: &[u8],
-        write_flags: u32,
-        flags: i32,
-        lock_owner: Option<u64>,
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
         reply: fuser::ReplyWrite,
     ) {
-        debug!(
-            "write(ino: {:#x}, fh: {}, offset: {}, data.len(): {}, write_flags: {:#x}, flags: {:#x}, lock_owner: {:?})",
-            ino,
-            fh,
-            offset,
-            data.len(),
-            write_flags,
-            flags,
-            lock_owner
-        );
-
         let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
@@ -1560,12 +1466,10 @@ impl Filesystem for RemoteFsClient {
         &mut self,
         _req: &fuser::Request<'_>,
         ino: u64,
-        fh: u64,
+        _fh: u64,
         offset: i64,
         mut reply: fuser::ReplyDirectory,
     ) {
-        debug!("readdir(ino: {:#x}, fh: {}, offset: {})", ino, fh, offset);
-
         let path = match self.inode_to_path(ino) {
             Some(p) => p,
             None => {
@@ -1582,12 +1486,12 @@ impl Filesystem for RemoteFsClient {
         match self.get_file_metadata(&path) {
             Some(metadata) if metadata.file_type == fuser::FileType::Directory => {
                 // Directory esiste, procedi
-            },
+            }
             Some(_) => {
                 error!("Path {} non è una directory", path);
                 reply.error(libc::ENOTDIR);
                 return;
-            },
+            }
             None => {
                 error!("Directory {} non trovata", path);
                 reply.error(libc::ENOENT);
@@ -1608,18 +1512,14 @@ impl Filesystem for RemoteFsClient {
             ("..".to_string(), 1, fuser::FileType::Directory),
         ];
 
-        info!("Processando {} entries da list_directory", entries.len());
-
         // Aggiungi tutte le entries trovate
         for (name, entry_ino, file_type) in entries {
-            info!("Aggiungendo entry: {} (ino: {}, type: {:?})", name, entry_ino, file_type);
             full_entries.push((name, entry_ino, file_type));
         }
 
         for (i, (name, entry_ino, file_type)) in
             full_entries.iter().enumerate().skip(offset as usize)
         {
-            info!("Sending to FUSE: {} (ino: {}, type: {:?})", name, entry_ino, file_type);
             if reply.add(*entry_ino, (i + 1) as i64, *file_type, name.as_str()) {
                 break;
             }
@@ -1771,11 +1671,9 @@ impl Filesystem for RemoteFsClient {
 
         // Crea il file (sempre RegularFile per create)
         let file_type = "RegularFile";
-        let effective_flags = flags | libc::O_WRONLY;  // Assicura che il file sia aperto in scrittura
-        let effective_mode = (mode & !umask) | libc::S_IFREG;  // Applica umask e forza tipo regular file
+        let effective_flags = flags | libc::O_WRONLY; // Assicura che il file sia aperto in scrittura
+        let effective_mode = (mode & !umask) | libc::S_IFREG; // Applica umask e forza tipo regular file
         let permissions = effective_mode & !libc::S_IFMT; // Estrai solo i permessi
-
-        info!("Creazione file: {} con permessi {:o}", full_path, permissions);
 
         // Prima verifica se il file esiste già
         if let Some(_) = self.get_file_metadata(&full_path) {
@@ -1798,16 +1696,11 @@ impl Filesystem for RemoteFsClient {
                 match self.open_file(&full_path, effective_flags) {
                     Ok(file_handle) => {
                         let file_attr = metadata.to_file_attr();
-                        
+
                         // Invalida cache directory padre
                         if let Some(parent_path) = self.inode_to_path(parent) {
                             self.invalidate_cache_for_directory(&parent_path);
                         }
-                        
-                        info!(
-                            "File created and opened: {} -> fh {} with flags {:#x}",
-                            full_path, file_handle, effective_flags
-                        );
                         reply.created(
                             &std::time::Duration::from_secs(1),
                             &file_attr,

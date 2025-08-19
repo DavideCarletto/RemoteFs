@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use log::{debug, info};
-use crate::filesystem::FileMetadata;
+use crate::types::FileMetadata;
 
 #[derive(Clone)]
 pub struct CachedMetadata {
