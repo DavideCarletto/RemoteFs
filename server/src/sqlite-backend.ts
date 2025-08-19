@@ -1,5 +1,7 @@
 import Database from 'better-sqlite3';
 import {INode} from './server'
+import * as fs from 'fs';
+import * as path from 'path';
 
 export interface FileHandle {
   file_handle: number;  //id file aperto
@@ -12,6 +14,11 @@ export class SQLiteBackend {
   private openFiles: Map<number, FileHandle>;  //classe mantiene una mappa dei file aperti
 
   constructor(dbPath: string) {
+    const dbDir = path.dirname(dbPath);
+    if (!fs.existsSync(dbDir)) {
+      fs.mkdirSync(dbDir, { recursive: true });
+    }
+    
     this.db = new Database(dbPath);
     this.openFiles = new Map();
     this.initializeDatabase();
