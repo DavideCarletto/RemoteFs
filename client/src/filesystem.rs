@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 const MAX_NAME_LENGTH: u32 = 255;
-const CHUNK_SIZE: usize = 64 * 1024; // 64KB chunks per tutti i file
+const CHUNK_SIZE: usize = 64 * 1024;
 
 pub struct RemoteFsClient {
     api_url: String,
@@ -465,7 +465,6 @@ impl RemoteFsClient {
         offset: i64,
         size: u32,
     ) -> Result<Vec<u8>, i32> {
-        //per file piccoli e offset 0, controlla cache
         #[cfg(feature = "cache")]
         if offset == 0 && size <= 1024 * 1024 {
             if let Some(metadata) = self.get_file_metadata(path) {
@@ -478,7 +477,6 @@ impl RemoteFsClient {
             }
         }
 
-        //cache miss o file grandi o cache disabilitata: chiamata HTTP
         debug!(
             "Lettura file in streaming: {} (fh: {}, offset: {}, size: {})",
             path, file_handle, offset, size
@@ -557,8 +555,8 @@ impl RemoteFsClient {
             }
         }
 
-        info!(
-            "Lettura streaming completata: {} chunks, {} bytes totali",
+        debug!(
+            "Lettura streaming completata: {} chunks totali, {} bytes totali",
             chunk_index,
             result.len()
         );
@@ -824,9 +822,10 @@ impl Filesystem for RemoteFsClient {
         let client = Client::new();
         match client.get(&health_url).send() {
             Ok(resp) if resp.status().is_success() => {
-                config.set_max_readahead(128 * 1024).ok();
-                config.set_max_write(128 * 1024).ok();
-                info!("Remote FS client initialized successfully.");
+                config.set_max_readahead(1024 * 1024).ok();  // 1MB readahead
+                config.set_max_write(1024 * 1024).ok();      // 1MB max write
+
+                info!("Remote FS client initialized with 1MB chunks.");
                 Ok(())
             }
             _ => {

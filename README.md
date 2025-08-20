@@ -30,8 +30,7 @@ cd RemoteFs
 ```bash
 cd server
 npm install
-ts-node src/server.ts
-# npm run dev  # Modalità sviluppo con auto-reload, per ora non usare perchè fa casini con wsl
+npm start
 ```
 Il server sarà disponibile su `http://localhost:3000`
 
@@ -73,7 +72,7 @@ cargo run -- --daemon --mount-point /tmp/my-remote-fs
 #### Step 1: Avvia il Server da un terminale wsl (Terminal 1)
 ```bash
 cd server
-ts-node src/server.ts
+npm start
 ```
 Il server sarà disponibile su `http://localhost:3000`
 
@@ -94,47 +93,29 @@ cd /tmp/remote-fs
 
 Una volta nel mount point `/tmp/remote-fs`, puoi usare questi comandi:
 
-#### ✅ Navigazione e Listagem
+#### ✅ Comandi Supportati Base
 ```bash
 ls                    # Lista contenuto directory corrente
 ls -la                # Lista dettagliata con permessi
 pwd                   # Mostra directory corrente
 cd documents          # Cambia directory
 cd ..                 # Torna indietro
-```
-
-#### ✅ Lettura File
-```bash
 cat test.txt          # Legge contenuto di un file
 file test.txt         # Mostra tipo di file
 stat test.txt         # Mostra metadati dettagliati
 head test.txt         # Prime righe del file
 tail test.txt         # Ultime righe del file
-```
-
-#### ✅ Creazione File e Directory
-```bash
 touch newfile.txt     # Crea nuovo file vuoto
 mkdir newdir          # Crea nuova directory
-```
-
-#### ✅ Rimozione
-```bash
 rm filename           # Rimuove un file
 rmdir dirname         # Rimuove una directory vuota
 ```
 
-#### ✅ Controllo Permessi
+#### ✅ Comandi Avanzati Supportati
 ```bash
-ls -la                # Mostra permessi dettagliati
-```
-
-#### ❌ Comandi NON Ancora Supportati
-```bash
-echo "text" > file    # Scrittura file (write non implementata)
+echo "text" > file    # Scrittura file con streaming
 cp file newfile       # Copia file
-mv file newname       # Rinomina/sposta file
-ln -s target link     # Link simbolici
+mv file newname       # Rinomina/sposta file  
 chmod 755 file        # Modifica permessi
 ```
 
@@ -151,19 +132,22 @@ chmod 755 file        # Modifica permessi
 
 ## 🔌 API del Server
 
-Il server espone i seguenti endpoint (Da modificare in fase finale per avere solo quelli richiesti):
+Il server espone i seguenti endpoint:
 
 | Endpoint | Metodo | Descrizione | Status |
 |----------|--------|-------------|--------|
 | `/health` | GET | Health check del server | ✅ |
+| `/list?path=<path>` | GET | Lista contenuto di una directory | ✅ |
+| `/files` | GET | Legge contenuto di un file (streaming) | ✅ |
+| `/files` | PUT | Scrive contenuto di un file (streaming) | ✅ |
+| `/files` | POST | Crea nuovo file regolare | ✅ |
+| `/files` | DELETE | Rimuove file/directory | ✅ |
+| `/mkdir` | POST | Crea nuova directory | ✅ |
+| `/open` | POST | Apre un file e restituisce file handle | ✅ |
+| `/rename` | POST | Rinomina/sposta file/directory | ✅ |
 | `/resolve-inode/:ino` | GET | Risolve inode in path | ✅ |
 | `/metadata?path=<path>` | GET | Ottiene metadati di un file | ✅ |
-| `/create` | POST | Crea nuovo file/directory | ✅ |
-| `/open` | POST | Apre un file e restituisce file handle | ✅ |
-| `/read` | POST | Legge contenuto di un file | ✅ |
-| `/listdir?path=<path>` | GET | Lista contenuto di una directory | ✅ |
-| `/remove?path=<path>&is_directory=<bool>` | DELETE | Rimuove file/directory | ✅ |
-| `/debug/files` | GET | Lista tutti i file mock (debug) | ✅ |
+| `/metadata?path=<path>` | PATCH | Aggiorna metadati di un file | ✅ |
 
 ## 🏗️ Architettura
 
@@ -171,15 +155,36 @@ Il server espone i seguenti endpoint (Da modificare in fase finale per avere sol
 ┌─────────────────┐    HTTP     ┌─────────────────┐
 │   FUSE Client   │ ◄────────► │   REST Server   │
 │     (Rust)      │   API       │ (Node.js/TS)    │
+│   + Cache LRU   │             │   + Streaming   │
 └─────────────────┘             └─────────────────┘
          │                               │
-         │ FUSE                         │ Mock FileSystem
+         │ FUSE                         │ SQLite DB + File Storage
          ▼                               ▼
 ┌─────────────────┐             ┌─────────────────┐
-│  Mount Point    │             │  In-Memory      │
-│ /tmp/remote-fs  │             │  Data Store     │
+│  Mount Point    │             │ fs_nodes (meta) │
+│ /tmp/remote-fs  │             │ + fs/ (files)   │
 └─────────────────┘             └─────────────────┘
 ```
+
+### 🗄️ **Persistenza e Storage**
+
+Il sistema utilizza un'architettura ibrida per la persistenza dei dati:
+
+- **Database SQLite** (`fs.sqlite`): Contiene solo i metadati dei file e directory
+  - Struttura filesystem (path, inode, permessi, timestamp)
+  - Informazioni sui file (dimensioni, tipo, proprietario)
+  - Relazioni parent-child per la gerarchia delle directory
+
+- **File fisici** (`fs/` directory): Contiene il contenuto effettivo dei file
+  - Ogni file è salvato con nome uguale al suo inode (es. `fs/2` per inode 2)
+  - Permette streaming efficiente per file di qualunque dimensione
+  - Compatibile con strumenti standard del filesystem
+
+**Vantaggi di questa architettura:**
+- **Performance**: Query veloci sui metadati, streaming diretto sui contenuti
+- **Scalabilità**: File grandi non impattano sul database
+- **Debugging**: File ispezionabili direttamente nel filesystem
+- **Backup**: Separazione tra struttura (DB) e contenuto (files)
 
 ## ⚙️ Stato dell'Implementazione
 
@@ -191,34 +196,49 @@ Il server espone i seguenti endpoint (Da modificare in fase finale per avere sol
 | `destroy` | Cleanup al dismount | Unmount pulito |
 | `lookup` | Risoluzione nomi file | `ls`, `cat`, `cd` |
 | `getattr` | Ottenimento metadati | `ls -l`, `stat`, `file` |
-| `setattr` | Modifica metadati (parziale) | Aggiornamento permessi |
+| `setattr` | Modifica metadati | `chmod`, aggiornamento timestamp |
 | `mknod` | Creazione file regolari | `touch` |
 | `mkdir` | Creazione directory | `mkdir` |
 | `unlink` | Rimozione file | `rm` |
 | `rmdir` | Rimozione directory | `rmdir` |
-| `open` | Apertura file | Preparazione lettura |
+| `rename` | Rinomina/sposta file | `mv` |
+| `open` | Apertura file | Preparazione lettura/scrittura |
 | `read` | Lettura contenuto file | `cat`, `head`, `tail` |
+| `write` | Scrittura contenuto file | `echo >`, editing file |
 | `readdir` | Lettura contenuto directory | `ls` |
 | `opendir` | Apertura directory | Preparazione `ls` |
 | `release` | Chiusura file | Cleanup automatico |
 | `releasedir` | Chiusura directory | Cleanup automatico |
+| `flush` | Sincronizzazione | Sync automatico |
 | `statfs` | Statistiche filesystem | `df` |
+| `access` | Controllo permessi | Test accesso file |
+| `create` | Creazione + apertura atomica | Creazione efficiente |
 
 ### ❌ Funzioni FUSE Non Implementate
 
-| Funzione | Descrizione | Status |
+| Funzione | Descrizione | Motivo |
 |----------|-------------|--------|
-| `rename` | Rinomina/sposta file | ⚠️ Implementata ma non testata |
-| `link` | Hard link | ❌ Non implementata |
-| `symlink` | Link simbolici | ❌ Non implementata |
-| `readlink` | Lettura link simbolici | ❌ Non implementata |
-| `create` | Creazione + apertura atomica | ✅ **IMPLEMENTATA** |
-| `access` | Controllo permessi | ✅ **IMPLEMENTATA** |
-| `flush` | Sincronizzazione | ✅ **IMPLEMENTATA** (no-op) |
-| `fsync` | Sincronizzazione forzata | ✅ **IMPLEMENTATA** (no-op) |
-| `fsyncdir` | Sincronizzazione directory | ✅ **IMPLEMENTATA** (no-op) |
-| Extended attributes | Attributi estesi | ✅ **IMPLEMENTATA** (non supportati) |
-| File locking | Lock di file | ❌ Non implementata |
+| `link` | Hard link | Non richiesto dalla specifica |
+| `symlink` | Link simbolici | Non richiesto dalla specifica |
+| `readlink` | Lettura link simbolici | Non richiesto dalla specifica |
+| Extended attributes | Attributi estesi | Non supportati dal server |
+| File locking | Lock di file | Non necessario per caso d'uso |
+| `fsync` | Sincronizzazione forzata | Gestita automaticamente |
+| `fsyncdir` | Sincronizzazione directory | Gestita automaticamente |
+
+### 🚀 **Sistema di Cache**
+
+Il client implementa un sistema di cache LRU (Least Recently Used) per ottimizzare le performance:
+
+- **Cache Metadati**: Memorizza informazioni sui file (dimensioni, permessi, timestamp)
+- **Cache Path-to-Inode**: Velocizza la risoluzione dei percorsi
+- **Cache Directory Listing**: Riduce le chiamate per `ls` ripetuti
+- **Invalidazione Intelligente**: La cache viene invalidata automaticamente dopo operazioni di modifica
+
+**Benefici:**
+- Riduzione significativa della latenza per operazioni ripetute
+- Minor carico sul server
+- Migliore responsività dell'interfaccia utente
 
 ## 🚨 Importante
 
@@ -238,177 +258,125 @@ sudo umount /tmp/remote-fs
 ## 🎯 Stato Attuale del Progetto
 
 ### ✅ **COMPLETATO - Funzionalità Core**
-- **Client FUSE**: Completamente implementato con tutte le funzioni essenziali
-- **Server HTTP**: API REST funzionante con 5 endpoint spec-compliant + endpoint FUSE support
-- **Comunicazione**: Protocollo HTTP ben definito e stabile tra client e server
-- **Operazioni Supportate**: Creazione, lettura, scrittura, eliminazione di file e directory
-- **Streaming**: Supporto per file di grandi dimensioni con chunking (64KB)
-- **Logging**: Sistema di log completo e configurabile
-- **Gestione Errori**: Error handling robusto su client e server
+- **Client FUSE**: Implementazione completa con tutte le funzioni essenziali
+- **Server HTTP**: API REST con streaming per file di grandi dimensioni
+- **Cache System**: Cache LRU integrata per ottimizzazione performance
+- **Persistenza Ibrida**: Database SQLite per metadati + file fisici per contenuti
+- **Operazioni Complete**: Lettura, scrittura, creazione, eliminazione, rinomina
+- **Streaming**: Supporto nativo per file di qualunque dimensione
+- **Gestione Errori**: Error handling robusto e logging completo
 
-### ✅ **FUNZIONALITÀ COMPLETAMENTE FUNZIONANTI**
+### ✅ **FUNZIONALITÀ COMPLETAMENTE OPERATIVE**
 ```bash
-# Navigazione
-ls, cd, pwd                    ✅ Funzionante
-ls -la                        ✅ Metadati completi
-stat file.txt                 ✅ Informazioni complete
+# Navigazione e informazioni
+ls, cd, pwd, stat                ✅ Con cache ottimizzata
+ls -la                          ✅ Metadati completi
 
-# File Operations  
-cat, head, tail               ✅ Lettura file con streaming
-touch file.txt                ✅ Creazione file
-echo "text" > file.txt        ✅ Scrittura file con streaming
-rm file.txt                   ✅ Eliminazione file
+# Operazioni sui file  
+cat, head, tail                 ✅ Streaming efficiente
+touch file.txt                  ✅ Creazione atomica
+echo "text" > file.txt          ✅ Scrittura con streaming
+rm file.txt                     ✅ Eliminazione sicura
 
-# Directory Operations
-mkdir newdir                  ✅ Creazione directory
-rmdir newdir                  ✅ Eliminazione directory
+# Operazioni directory
+mkdir newdir                    ✅ Creazione con metadati
+rmdir newdir                    ✅ Rimozione con controlli
 
-# Advanced Operations
-cp file newfile               ✅ Funziona (via read+write)
+# Operazioni avanzate
+cp file newfile                 ✅ Copia via streaming
+mv file newfile                 ✅ Rinomina/sposta atomica
+chmod 755 file                  ✅ Modifica permessi
 ```
 
-### 🎯 **PROSSIMI SVILUPPI PIANIFICATI**
+### 🏆 **ARCHITETTURA FINALE**
 
-#### 🔥 **1. Sistema di Cache (Priorità Alta)**
-- **Obiettivo**: Migliorare performance riducendo chiamate HTTP ripetute
-- **Implementazione Proposta**:
+Il sistema ha raggiunto una architettura matura e scalabile:
+
+- **Performance**: Cache LRU riduce latenza su operazioni ripetute
+- **Scalabilità**: Streaming nativo gestisce file fino a GB senza limiti di memoria
+- **Affidabilità**: Database transazionale garantisce consistenza dei metadati
+- **Manutenibilità**: Separazione chiara tra metadati (DB) e contenuti (filesystem)
+
+### 🔧 **Possibili Estensioni Future**
+
+#### **1. Supporto Multi-Piattaforma (Dalla Specifica Originale)**
+- **⚪ macOS Support**: Integrazione con macFUSE per supporto macOS nativo
+  ```bash
+  # Target: Supporto macOS con macFUSE
+  brew install macfuse
+  cargo build --target x86_64-apple-darwin
+  ```
+- **⚪ Windows Support**: Implementazione con WinFSP o Dokany per Windows
   ```rust
-  struct ClientCache {
-      metadata_cache: LRU<String, FileMetadata>,    // Cache metadati file
-      content_cache: LRU<String, Vec<u8>>,          // Cache contenuto file piccoli
-      directory_cache: LRU<String, Vec<DirEntry>>,  // Cache listing directory
-      inode_path_cache: LRU<u64, String>,          // Cache inode->path mapping
-      ttl: Duration,                                 // Time-to-live configurabile
-  }
+  // Target: Supporto Windows filesystem
+  #[cfg(target_os = "windows")]
+  use winfsp_rs::*;  // o dokany-rs
   ```
-- **Benefici Attesi**: 
-  - Riduzione latenza su operazioni ripetute (es. `ls` multipli)
-  - Minore carico sul server
-  - Migliore esperienza utente
-- **Strategie**: Cache LRU con TTL configurabile e invalidazione intelligente
 
-#### 🗄️ **2. Persistenza Server (Priorità Alta)**
-- **Problema Attuale**: Tutti i dati sono in-memory e si perdono al restart del server
-- **Soluzioni Possibili**:
+#### **2. Sicurezza e Produzione**
+- **🔒 HTTPS/TLS Support**: Comunicazione sicura client-server
   ```typescript
-  // Opzione 1: File System Backend
-  class FileSystemBackend {
-    private basePath: string;
-    saveFile(path: string, content: Buffer): Promise<void>
-    loadFile(path: string): Promise<Buffer>
-    saveMetadata(path: string, metadata: INode): Promise<void>
-  }
-
-  // Opzione 2: SQLite Backend (Raccomandato)
-  class SQLiteBackend {
-    // Schema veloce da implementare, perfetto per prototipo
-    // Supporta transazioni e concorrenza
-  }
-
-  // Opzione 3: PostgreSQL Backend (Per produzione)
-  class PostgreSQLBackend {
-    // Massima scalabilità e robustezza
-  }
-  ```
-- **Implementazione Suggerita**: Iniziare con SQLite per semplicità
-
-#### 🗃️ **3. Database per Metadati (Priorità Media)**
-- **Obiettivo**: Gestione efficiente e scalabile dei metadati filesystem
-- **Schema Database Proposto**:
-  ```sql
-  -- Tabella principale nodi filesystem
-  CREATE TABLE fs_nodes (
-      ino BIGINT PRIMARY KEY,
-      path VARCHAR(4096) UNIQUE NOT NULL,
-      parent_ino BIGINT REFERENCES fs_nodes(ino),
-      name VARCHAR(255) NOT NULL,
-      file_type VARCHAR(20) NOT NULL CHECK (file_type IN ('RegularFile', 'Directory')),
-      size BIGINT DEFAULT 0,
-      permissions INTEGER DEFAULT 644,
-      uid INTEGER DEFAULT 1000,
-      gid INTEGER DEFAULT 1000,
-      atime TIMESTAMP DEFAULT NOW(),
-      mtime TIMESTAMP DEFAULT NOW(),
-      ctime TIMESTAMP DEFAULT NOW(),
-      crtime TIMESTAMP DEFAULT NOW(),
-      blocks BIGINT DEFAULT 0,
-      blksize INTEGER DEFAULT 512,
-      nlink INTEGER DEFAULT 1
-  );
-
-  -- Indici per performance
-  CREATE INDEX idx_fs_nodes_path ON fs_nodes(path);
-  CREATE INDEX idx_fs_nodes_parent ON fs_nodes(parent_ino);
-  CREATE INDEX idx_fs_nodes_name ON fs_nodes(name);
-
-  -- Tabella contenuto file (per file piccoli < 1MB)
-  CREATE TABLE fs_content (
-      ino BIGINT PRIMARY KEY REFERENCES fs_nodes(ino) ON DELETE CASCADE,
-      content BYTEA NOT NULL
-  );
-
-  -- Tabella chunks (per file grandi >= 1MB)
-  CREATE TABLE fs_chunks (
-      ino BIGINT REFERENCES fs_nodes(ino) ON DELETE CASCADE,
-      chunk_index INTEGER NOT NULL,
-      chunk_size INTEGER NOT NULL,
-      chunk_data BYTEA NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW(),
-      PRIMARY KEY (ino, chunk_index)
-  );
+  // Server con certificati SSL/TLS
+  const https = require('https');
+  const fs = require('fs');
+  
+  const options = {
+    key: fs.readFileSync('private-key.pem'),
+    cert: fs.readFileSync('certificate.pem')
+  };
+  
+  https.createServer(options, app).listen(443);
   ```
 
-### 🔧 **Refactoring e Miglioramenti Tecnici**
-
-#### **Server API - Possibili Miglioramenti**
-```typescript
-// Attuale: Mix di endpoint spec-compliant e FUSE-specific
-// Futuro: Organizzazione più pulita
-
-// Endpoint Spec-Compliant (da mantenere)
-app.get('/list', ...)      // ✅ Spec requirement
-app.get('/files', ...)     // ✅ Spec requirement  
-app.put('/files', ...)     // ✅ Spec requirement
-app.post('/files', ...)    // ✅ Nuovo per creazione file
-app.post('/mkdir', ...)    // ✅ Spec requirement
-app.delete('/files', ...)  // ✅ Spec requirement
-
-// Endpoint FUSE Support (da raggruppare sotto /fs/)
-app.get('/fs/metadata', ...)     // Era /metadata
-app.patch('/fs/metadata', ...)   // Era /metadata  
-app.post('/fs/open', ...)        // Era /open
-app.post('/fs/rename', ...)      // Era /rename
-app.get('/fs/resolve-inode/:ino', ...)  // Era /resolve-inode/:ino
-```
-
-#### **Client Cache Architecture**
-```rust
-// Architettura cache proposta
-pub struct RemoteFsClient {
-    api_url: String,
-    cache: Option<ClientCache>,  // Cache opzionale configurabile
-}
-
-impl RemoteFsClient {
-    pub fn with_cache(api_url: String, cache_config: CacheConfig) -> Self {
-        let cache = ClientCache::new(cache_config);
-        Self { api_url, cache: Some(cache) }
-    }
+#### **3. Containerizzazione e Deployment**
+- **🐳 Docker Support**: Containerizzazione completa del sistema
+  ```dockerfile
+  # Dockerfile per server
+  FROM node:18-alpine
+  WORKDIR /app
+  COPY package*.json ./
+  RUN npm ci --only=production
+  COPY . .
+  EXPOSE 3000
+  CMD ["npm", "start"]
+  ```
+  ```dockerfile
+  # Dockerfile per client (con FUSE support)
+  FROM rust:1.70-slim
+  RUN apt-get update && apt-get install -y fuse libfuse-dev
+  WORKDIR /app
+  COPY . .
+  RUN cargo build --release
+  CMD ["./target/release/remote-fs"]
+  ```
+- **🎛️ Docker Compose**: Orchestrazione multi-container
+  ```yaml
+  version: '3.8'
+  services:
+    remote-fs-server:
+      build: ./server
+      ports:
+        - "3000:3000"
+      volumes:
+        - ./data:/app/data
     
-    pub fn without_cache(api_url: String) -> Self {
-        Self { api_url, cache: None }
-    }
-}
-```
+    remote-fs-client:
+      build: ./client
+      privileged: true  # Required for FUSE
+      devices:
+        - /dev/fuse
+      volumes:
+        - /tmp/remote-fs:/mnt/remote-fs:shared
+  ```
 
-### 🧪 **Testing Strategy (Da Implementare)**
+### 🧪 **Testing Strategy Future**
 ```bash
-# Test Categories da aggiungere:
+# Possibili test aggiuntivi da implementare:
 tests/
-├── unit/           # Test singole funzioni FUSE
-├── integration/    # Test client-server end-to-end  
-├── performance/    # Test di carico e stress
-└── compatibility/ # Test con vari tool Unix (cp, mv, etc.)
+├── stress/         # Test di carico estremo (1000+ file, GB di dati)
+├── network/        # Test con latenza/disconnessioni simulate
+├── concurrent/     # Test multi-client simultanei
+└── benchmark/      # Confronto performance con filesystem locali
 ```
 
 ---

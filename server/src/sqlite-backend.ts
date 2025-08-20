@@ -80,7 +80,14 @@ export class SQLiteBackend {
       ?, 512, 1
     )
   `);
-  const testContent = Buffer.from("Questo è il contenuto del file test.txt\nSeconda riga di esempio\n");
+  const baseText = "Non si intrometta! No, aspetti, mi porga l'indice; ";
+  // Crea un file di test da ~10MB
+  const targetSizeMB = 10;
+  const targetSizeBytes = targetSizeMB * 1024 * 1024; // 10MB in bytes
+  const repeatCount = Math.ceil(targetSizeBytes / baseText.length);
+  const testContent = Buffer.from(baseText.repeat(repeatCount));
+  
+  console.log(`[INIT] Creating test.txt with size: ${Math.round(testContent.length / (1024 * 1024) * 100) / 100}MB`);
   testFileStmt.run(testContent.length, Math.ceil(testContent.length / 512));
 
   // Crea il file fisico per test.txt
