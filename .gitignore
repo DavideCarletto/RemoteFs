@@ -2,6 +2,7 @@
 /client/target/
 /client/Cargo.lock
 **/*.rs.bk
+temp_doc/
 
 # Node/TypeScript
 /server/node_modules/
