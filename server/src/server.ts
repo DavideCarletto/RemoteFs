@@ -26,62 +26,48 @@ export interface INode {
   blksize: number;
 }
 
-
-
-
 // List directory content endpoint
 app.get('/list', (req, res) => {
-  console.log('[LISTDIR] Received request:', req.query);
   
   const path = req.query.path as string;
 
   if (!path) {
-    console.error('[LISTDIR] Missing path parameter');
     return res.status(400).json({ error: 'Path parameter is required' });
   }
 
   try {
     const metadata = sqliteBackend.getFileMetadataByPath(path);
     if (!metadata) {
-      console.error('[LISTDIR] Directory not found:', path);
       return res.status(404).json({ error: 'Directory not found' });
     }
 
     if (metadata.file_type !== 'Directory') {
-      console.error('[LISTDIR] Path is not a directory:', path, 'type:', metadata.file_type);
       return res.status(400).json({ error: 'Path is not a directory' });
     }
 
     const entries = sqliteBackend.listDirectory(path);
-    console.log(`[LISTDIR] Directory ${path} contains ${entries.length} entries`);
     
     res.json({ entries });
   } catch (err) {
-    console.error('[LISTDIR] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Read file content endpoint
 app.get('/files', (req, res) => {
-  console.log('[READ] Received request:', JSON.stringify(req.body, null, 2));
-  
   const { path, file_handle, offset, size, chunk_index } = req.body;
 
   if (!path || file_handle === undefined) {
-    console.error('[READ] Missing required parameters:', { path, file_handle });
     return res.status(400).json({ error: 'Path and file handle are required' });
   }
 
   try {
     const metadata = sqliteBackend.getFileMetadataByPath(path);
     if (!metadata) {
-      console.error('[READ] File not found:', path);
       return res.status(404).json({ error: 'File not found' });
     }
 
     if (metadata.file_type !== 'RegularFile') {
-      console.error('[READ] Cannot read non-regular file:', path, 'type:', metadata.file_type);
       return res.status(400).json({ error: 'Cannot read directory or special file' });
     }
 
@@ -92,7 +78,6 @@ app.get('/files', (req, res) => {
     const actualEndOffset = Math.min(startOffset + requestedSize - 1, metadata.size - 1);
     const actualSize = Math.max(0, actualEndOffset - startOffset + 1);
     
-    console.log(`[READ] Streaming ${actualSize} bytes from ${path} (offset: ${startOffset}, file size: ${metadata.size})`);
     
     const readStream = sqliteBackend.readFile(path, { 
       start: startOffset, 
@@ -100,7 +85,6 @@ app.get('/files', (req, res) => {
     });
     
     if (!readStream) {
-      console.error('[READ] Failed to create read stream for:', path);
       return res.status(500).json({ error: 'Failed to create read stream' });
     }
 
@@ -108,60 +92,50 @@ app.get('/files', (req, res) => {
     res.set('Content-Length', actualSize.toString());
     
     readStream.on('error', (error: Error) => {
-      console.error('[READ] Stream error:', error);
       if (!res.headersSent) {
         res.status(500).json({ error: 'Stream error' });
       }
     });
 
     if (chunk_index !== undefined) {
-      console.log(`[READ] Streaming chunk ${chunk_index}: ${actualSize} bytes from offset ${startOffset}`);
     }
 
     readStream.pipe(res);
   } catch (err) {
-    console.error('[READ] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Write file content endpoint
 app.put('/files', (req, res) => {
-  console.log('[WRITE] Received streaming write request');
   
   const path = req.headers['x-path'] as string;
   const file_handle = req.headers['x-file-handle'] as string;
   const offset = parseInt(req.headers['x-offset'] as string);
 
   if (!path || !file_handle || isNaN(offset)) {
-    console.error('[WRITE] Missing required headers:', { path, file_handle, offset });
     return res.status(400).json({ error: 'Required headers: x-path, x-file-handle, x-offset' });
   }
 
   try {
     const metadata = sqliteBackend.getFileMetadataByPath(path);
     if (!metadata) {
-      console.error('[WRITE] File not found:', path);
       return res.status(404).json({ error: 'File not found' });
     }
 
     if (metadata.file_type !== 'RegularFile') {
-      console.error('[WRITE] Cannot write to non-regular file:', path, 'type:', metadata.file_type);
       return res.status(400).json({ error: 'Cannot write to directory or special file' });
     }
 
-    console.log(`[WRITE] Streaming write to ${path} at offset ${offset}`);
     
     const writeStream = sqliteBackend.writeFile(path, { start: offset });
     if (!writeStream) {
-      console.error('[WRITE] Failed to create write stream for:', path);
       return res.status(500).json({ error: 'Failed to create write stream' });
     }
 
     let totalBytesWritten = 0;
 
     writeStream.on('error', (error) => {
-      console.error('[WRITE] Stream error:', error);
       if (!res.headersSent) {
         res.status(500).json({ error: 'Stream write error' });
       }
@@ -169,11 +143,8 @@ app.put('/files', (req, res) => {
 
     writeStream.on('finish', () => {
       try {
-        // Aggiorna i metadati del file dopo la scrittura
         sqliteBackend.updateFileSize(path);
         const updatedMetadata = sqliteBackend.getFileMetadataByPath(path);
-        
-        console.log(`[WRITE] Completed streaming write: ${totalBytesWritten} bytes to ${path} at offset ${offset}, new size: ${updatedMetadata?.size}`);
         
         if (!res.headersSent) {
           res.json({ 
@@ -183,7 +154,6 @@ app.put('/files', (req, res) => {
           });
         }
       } catch (err) {
-        console.error('[WRITE] Error updating metadata after stream:', err);
         if (!res.headersSent) {
           res.status(500).json({ error: 'Error updating file metadata' });
         }
@@ -194,12 +164,10 @@ app.put('/files', (req, res) => {
       totalBytesWritten += chunk.length;
       
       if (totalBytesWritten % (10 * 1024 * 1024) === 0) {
-        console.log(`[WRITE] Streamed ${Math.round(totalBytesWritten / 1024 / 1024)}MB for ${path}`);
       }
     });
 
     req.on('error', (error) => {
-      console.error('[WRITE] Error during write request:', error);
       if (!res.headersSent) {
         res.status(500).json({ error: 'Error processing file data' });
       }
@@ -207,7 +175,6 @@ app.put('/files', (req, res) => {
 
     req.pipe(writeStream);
   } catch (err) {
-    console.error('[WRITE] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -216,34 +183,23 @@ app.put('/files', (req, res) => {
 app.post('/files', (req, res) => {
   const { path, file_type, mode, uid, gid, rdev, umask } = req.body;
   
-  console.log(`📝 Richiesta creazione file: ${path}, tipo: ${file_type}`);
-  console.log(`   - Mode: ${mode}, UID: ${uid}, GID: ${gid}, rdev: ${rdev}, umask: ${umask}`);
-  
-  // Validazione input
   if (!path || !file_type) {
-    console.log(`❌ Parametri mancanti: path=${path}, file_type=${file_type}`);
     return res.status(400).json({ error: "Path e file_type sono richiesti" });
   }
   
-  // Solo per file regolari in questo endpoint
   if (file_type !== "RegularFile") {
-    console.log(`❌ Tipo file non supportato in /api/files: ${file_type}`);
     return res.status(400).json({ error: "Questo endpoint supporta solo RegularFile" });
   }
 
   try {
-    // Check if file already exists
     const existingFile = sqliteBackend.getFileMetadataByPath(path);
     if (existingFile) {
-      console.log(`❌ File già esistente: ${path}`);
       return res.status(409).json({ error: "File già esistente" });
     }
     
-    // Get parent directory's inode
     const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
     const parentIno = sqliteBackend.getInodeByPath(parentPath);
     if (!parentIno) {
-      console.log(`❌ Directory padre non trovata: ${parentPath}`);
       return res.status(404).json({ error: "Directory padre non trovata" });
     }
     
@@ -269,34 +225,23 @@ app.post('/files', (req, res) => {
 app.post("/mkdir", (req, res) => {
   const { path, file_type, mode, uid, gid, rdev, umask } = req.body;
   
-  console.log(`📝 Richiesta creazione directory: ${path}, tipo: ${file_type}`);
-  console.log(`   - Mode: ${mode}, UID: ${uid}, GID: ${gid}, rdev: ${rdev}, umask: ${umask}`);
-  
-  // Validazione input
   if (!path || !file_type) {
-    console.log(`❌ Parametri mancanti: path=${path}, file_type=${file_type}`);
     return res.status(400).json({ error: "Path e file_type sono richiesti" });
   }
   
-  // Solo per directory in questo endpoint
   if (file_type !== "Directory") {
-    console.log(`❌ Tipo file non supportato in /mkdir: ${file_type}`);
     return res.status(400).json({ error: "Questo endpoint supporta solo Directory" });
   }
 
   try {
-    // Check if directory already exists
     const existingDir = sqliteBackend.getFileMetadataByPath(path);
     if (existingDir) {
-      console.log(`❌ Directory già esistente: ${path}`);
       return res.status(409).json({ error: "Directory già esistente" });
     }
     
-    // Get parent directory's inode
     const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
     const parentIno = sqliteBackend.getInodeByPath(parentPath);
     if (!parentIno) {
-      console.log(`❌ Directory padre non trovata: ${parentPath}`);
       return res.status(404).json({ error: "Directory padre non trovata" });
     }
     
@@ -323,30 +268,22 @@ app.delete("/files", (req, res) => {
   const path = req.query.path as string;
   const isDirectory = req.query.is_directory === 'true';
   
-  console.log(`🗑️ Richiesta rimozione: ${path} (directory: ${isDirectory})`);
-  
-  // Validazione input
   if (!path) {
-    console.log(`❌ Path mancante nella richiesta di rimozione`);
     return res.status(400).json({ error: "Path richiesto" });
   }
   
   try {
     const fileToRemove = sqliteBackend.getFileMetadataByPath(path);
     if (!fileToRemove) {
-      console.log(`❌ File non trovato per rimozione: ${path}`);
       return res.status(404).json({ error: "File non trovato" });
     }
     
-    // Verifica coerenza tipo (directory vs file)
     const isActuallyDirectory = fileToRemove.file_type === "Directory";
     if (isDirectory && !isActuallyDirectory) {
-      console.log(`❌ Tentativo di rmdir su file normale: ${path}`);
       return res.status(400).json({ error: "Non è una directory" });
     }
     
     if (!isDirectory && isActuallyDirectory) {
-      console.log(`❌ Tentativo di unlink su directory: ${path}`);
       return res.status(400).json({ error: "È una directory, usa rmdir" });
     }
     
@@ -354,27 +291,20 @@ app.delete("/files", (req, res) => {
     if (!result.success) {
       switch (result.error) {
         case 'no_such_file_or_directory':
-          console.log(`❌ File non trovato per rimozione: ${path}`);
           return res.status(404).json({ error: "File non trovato" });
         case 'not_a_directory':
-          console.log(`❌ Path non è una directory: ${path}`);
           return res.status(400).json({ error: "Non è una directory" });
         case 'is_a_directory':
-          console.log(`❌ Path è una directory: ${path}`);
           return res.status(400).json({ error: "È una directory, usa rmdir" });
         case 'directory_not_empty':
-          console.log(`❌ Directory non vuota: ${path}`);
           return res.status(409).json({ error: "Directory non vuota" });
         default:
-          console.error(`❌ Errore durante la rimozione:`, result.error);
           return res.status(500).json({ error: "Errore durante la rimozione" });
       }
     }
     
-    console.log(`✅ Filesystem object rimosso: ${path} (inode ${fileToRemove.ino})`);
     res.status(200).json({ message: "Rimosso con successo" });
   } catch (err) {
-    console.error(`❌ Errore durante la rimozione:`, err);
     res.status(500).json({ error: "Errore durante la rimozione" });
   }
 });
@@ -383,76 +313,61 @@ app.delete("/files", (req, res) => {
 app.post("/open", (req, res) => {
   const { path, flags } = req.body;
   
-  console.log(`📂 Richiesta apertura file: ${path}, flags: ${flags}`);
-  
-  // Validazione input
   if (!path) {
-    console.log(`❌ Path mancante nella richiesta di apertura`);
     return res.status(400).json({ error: "Path richiesto" });
   }
   
   try {
     const file = sqliteBackend.getFileMetadataByPath(path);
     if (!file) {
-      console.log(`❌ File non trovato per apertura: ${path}`);
       return res.status(404).json({ error: "File non trovato" });
     }
     
     // Controlla che non sia una directory (a meno che non sia opendir)
     if (file.file_type === "Directory") {
-      console.log(`❌ Tentativo di open su directory: ${path}`);
       return res.status(400).json({ error: "È una directory, usa opendir" });
     }
     
     const fileHandle = sqliteBackend.openFile({ path, flags });
-    console.log(`✅ File aperto: ${path} -> file handle ${fileHandle.file_handle}`);
     res.status(200).json(fileHandle);
   } catch (err) {
-    console.error(`❌ Errore durante l'apertura:`, err);
     res.status(500).json({ error: "Errore durante l'apertura del file" });
   }
 });
 
 // Endpoint per rinominare/spostare file e directory
 app.post('/rename', (req, res) => {
-  console.log('[RENAME] Received request:', JSON.stringify(req.body, null, 2));
   
   const { old_path, new_path } = req.body;
   
   if (!old_path || !new_path) {
-    console.error('[RENAME] Missing required parameters:', { old_path, new_path });
     return res.status(400).json({ error: 'Both old_path and new_path are required' });
   }
 
   try {
     const sourceFile = sqliteBackend.getFileMetadataByPath(old_path);
     if (!sourceFile) {
-      console.error(`[RENAME] Source file not found: ${old_path}`);
       return res.status(404).json({ error: 'Source file not found' });
     }
 
     const destFile = sqliteBackend.getFileMetadataByPath(new_path);
     if (destFile) {
-      console.error(`[RENAME] Destination already exists: ${new_path}`);
       return res.status(409).json({ error: 'Destination already exists' });
     }
 
     const newParentPath = new_path.substring(0, new_path.lastIndexOf('/')) || '/';
     const parentIno = sqliteBackend.getInodeByPath(newParentPath);
     if (!parentIno) {
-      console.error(`[RENAME] Parent directory not found: ${newParentPath}`);
       return res.status(404).json({ error: 'Parent directory not found' });
     }
 
     if (sourceFile.file_type === 'Directory' && new_path.startsWith(old_path + '/')) {
-      console.error(`[RENAME] Cannot move directory into itself: ${old_path} -> ${new_path}`);
       return res.status(400).json({ error: 'Cannot move directory into itself' });
     }
 
     sqliteBackend.renameNode(old_path, new_path);
     const updatedMetadata = sqliteBackend.getFileMetadataByPath(new_path);
 
-    console.log(`[RENAME] Successfully moved: ${old_path} -> ${new_path}`);
     res.json({ 
       message: 'File renamed successfully',
       old_path,
@@ -460,7 +375,6 @@ app.post('/rename', (req, res) => {
       metadata: updatedMetadata
     });
   } catch (err) {
-    console.error('[RENAME] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -472,25 +386,16 @@ app.get("/health", (req, res) => {
 // Endpoint per risolvere inode -> path
 app.get("/resolve-inode/:ino", (req, res) => {
   const ino = parseInt(req.params.ino);
-  
-  console.log(`🔍 Richiesta risoluzione inode: ${ino}`);
-  
   if (isNaN(ino)) {
-    console.log(`❌ Inode non valido: ${req.params.ino}`);
     return res.status(400).json({ error: "Inode non valido" });
   }
-  
   try {
     const path = sqliteBackend.resolveInode(ino);
     if (!path) {
-      console.log(`❌ Inode ${ino} non trovato`);
       return res.status(404).json({ error: "Inode non trovato" });
     }
-    
-    console.log(`✅ Inode ${ino} risolto in: ${path}`);
     res.send(path);
   } catch (err) {
-    console.error(`❌ Errore durante la risoluzione dell'inode:`, err);
     res.status(500).json({ error: "Errore durante la risoluzione dell'inode" });
   }
 });
@@ -498,50 +403,34 @@ app.get("/resolve-inode/:ino", (req, res) => {
 // Endpoint per ottenere metadati di un file
 app.get("/metadata", (req, res) => {
   const path = req.query.path as string;
-  
-  console.log(`📋 Richiesta metadati per: ${path}`);
-  
   if (!path) {
-    console.log(`❌ Path mancante nella richiesta`);
     return res.status(400).json({ error: "Path richiesto" });
   }
   
   try {
     const metadata = sqliteBackend.getFileMetadataByPath(path);
     if (!metadata) {
-      console.log(`❌ File non trovato: ${path}`);
       return res.status(404).json({ error: "File non trovato" });
     }
-    
-    console.log(`✅ Metadati trovati per ${path}: inode ${metadata.ino}, tipo ${metadata.file_type}`);
     res.json(metadata);
   } catch (err) {
-    console.error(`❌ Errore durante il recupero dei metadati:`, err);
     res.status(500).json({ error: "Errore durante il recupero dei metadati" });
   }
 });
 
 // Endpoint per aggiornare metadati di un file
 app.patch("/metadata", (req, res) => {
-  console.log('[PATCH METADATA] Received request:', JSON.stringify(req.body, null, 2));
-  
   const path = req.query.path as string;
   if (!path) {
-    console.error('[PATCH METADATA] Missing path parameter');
     return res.status(400).json({ error: "Path parameter is required" });
   }
-
   try {
     const updatedMetadata = sqliteBackend.updateMetadata(path, req.body);
     if (!updatedMetadata) {
-      console.error(`[PATCH METADATA] File not found: ${path}`);
       return res.status(404).json({ error: "File not found" });
     }
-
-    console.log(`[PATCH METADATA] Updated metadata for: ${path}`);
     res.json(updatedMetadata);
   } catch (err) {
-    console.error('[PATCH METADATA] Error:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

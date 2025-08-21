@@ -87,7 +87,6 @@ export class SQLiteBackend {
   const repeatCount = Math.ceil(targetSizeBytes / baseText.length);
   const testContent = Buffer.from(baseText.repeat(repeatCount));
   
-  console.log(`[INIT] Creating test.txt with size: ${Math.round(testContent.length / (1024 * 1024) * 100) / 100}MB`);
   testFileStmt.run(testContent.length, Math.ceil(testContent.length / 512));
 
   // Crea il file fisico per test.txt
@@ -160,7 +159,6 @@ export class SQLiteBackend {
     const dirIno = path === '/' ? 1 : this.getInodeByPath(path);
     
     if (dirIno !== undefined) {
-      console.log(`[LISTDIR] Listing directory with inode ${dirIno}`);
       
       const stmt = this.db.prepare(`
         SELECT ino, name, file_type 
@@ -171,7 +169,6 @@ export class SQLiteBackend {
       
       try {
         entries = stmt.all(dirIno) as Array<{ ino: number; name: string; file_type: string }>;
-        console.log(`[LISTDIR] Found ${entries.length} entries:`, entries.map(e => e.name).join(', '));
       } catch (error) {
         console.error(`[LISTDIR] Error listing directory ${path}:`, error);
       }
@@ -217,13 +214,11 @@ export class SQLiteBackend {
 
   //elimina un file o directory
   deleteNode(path: string, isDirectory?: boolean): { success: boolean; error?: string } {
-    console.log(`[DELETE] Tentativo di rimozione: ${path} (isDirectory: ${isDirectory})`);
     
     const checkStmt = this.db.prepare('SELECT ino, file_type FROM fs_nodes WHERE path = ?');
     const node = checkStmt.get(path) as { ino: number; file_type: string } | undefined;
     
     if (!node) {
-      console.log(`[DELETE] Nodo non trovato: ${path}`);
       return { success: false, error: 'no_such_file_or_directory' };
     }
 
@@ -240,7 +235,6 @@ export class SQLiteBackend {
       const checkEmptyStmt = this.db.prepare('SELECT COUNT(*) as count FROM fs_nodes WHERE parent_ino = ?');
       const result = checkEmptyStmt.get(node.ino) as { count: number };
       if (result.count > 0) {
-        console.log(`[DELETE] Directory non vuota: ${path}`);
         return { success: false, error: 'directory_not_empty' };
       }
     }
@@ -258,7 +252,6 @@ export class SQLiteBackend {
         nodeStmt.run(node.ino);
       })();
 
-      console.log(`[DELETE] Nodo rimosso con successo: ${path}`);
       return { success: true };
     } catch (error) {
       console.error(`[DELETE] Errore durante la rimozione di ${path}:`, error);
@@ -396,38 +389,38 @@ export class SQLiteBackend {
     const setFields: string[] = [];
     const params: any = { path };
 
-    if (updates.mode !== undefined) {
+    if (updates.mode != null) {
       setFields.push('permissions = @mode');
       params.mode = updates.mode;
     }
-    if (updates.uid !== undefined) {
+    if (updates.uid != null) {
       setFields.push('uid = @uid');
       params.uid = updates.uid;
     }
-    if (updates.gid !== undefined) {
+    if (updates.gid != null) {
       setFields.push('gid = @gid');
       params.gid = updates.gid;
     }
-    if (updates.size !== undefined) {
+    if (updates.size != null) {
       setFields.push('size = @size');
       params.size = updates.size;
       params.blocks = Math.ceil(updates.size / 512);
       setFields.push('blocks = @blocks');
     }
 
-    if (updates.atime !== undefined) {
+    if (updates.atime != null) {
       setFields.push('atime = @atime');
       params.atime = updates.atime;
     }
-    if (updates.mtime !== undefined) {
+    if (updates.mtime != null) {
       setFields.push('mtime = @mtime');
       params.mtime = updates.mtime;
     }
-    if (updates.ctime !== undefined) {
+    if (updates.ctime != null) {
       setFields.push('ctime = @ctime');
       params.ctime = updates.ctime;
     }
-    if (updates.crtime !== undefined) {
+    if (updates.crtime != null) {
       setFields.push('crtime = @crtime');
       params.crtime = updates.crtime;
     }

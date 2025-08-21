@@ -1,11 +1,13 @@
-pub mod filesystem;
+// Core modules - Architettura modulare
+pub mod client;
+pub mod backends;
 pub mod cache;
 pub mod types;
 
-#[cfg(target_os = "windows")]
-pub mod winfsp_fs;
-
-#[cfg(target_os = "linux")]
-pub use filesystem::RemoteFsClient;
+// Re-exports principali
+pub use client::RemoteFsClient;
 pub use cache::{CacheConfig, CacheInvalidationStrategy, FileSystemCache};
 pub use types::FileMetadata;
+
+// Re-exports dei backends (architettura principale)
+pub use backends::*;

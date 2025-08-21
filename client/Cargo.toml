@@ -8,6 +8,7 @@ edition = "2024"
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = "4.5.44"
 colored = "3.0.0"
+ctrlc = "3.4"
 fern = "0.7.1"
 libc = "0.2.175"
 log = "0.4"

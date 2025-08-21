@@ -17,3 +17,6 @@ temp_doc/
 
 # Filesystem storage
 /server/fs/
+
+#datatmp
+/datatmp/

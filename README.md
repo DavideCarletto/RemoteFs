@@ -1,5 +1,15 @@
 Ciao michi
 
+installare winfsp 
+choco install winfsp
+
+se non hai choco:
+Set-ExecutionPolicy Bypass -Scope Process -Force; `
+[System.Net.ServicePointManager]::SecurityProtocol = `
+[System.Net.ServicePointManager]::SecurityProtocol -bor 3072; `
+iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+
 # Remote Filesystem (FUSE)
 
 Un client filesystem remoto implementato in Rust che utilizza FUSE per montare un filesystem che rispecchia la struttura di un server remoto via REST API.

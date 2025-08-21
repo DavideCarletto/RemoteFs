@@ -1,13 +1,23 @@
-
-// Versione Linux: usa i tipi FUSE
 #[cfg(target_os = "linux")]
 use fuser::{FileAttr, FileType};
-#[cfg(target_os = "linux")]
 use serde::Deserialize;
-#[cfg(target_os = "linux")]
 use std::time::{Duration, SystemTime};
 
+#[derive(Deserialize, Debug, Clone)]
+pub enum RemoteFsFileType {
+    Directory,
+    RegularFile,
+}
 #[cfg(target_os = "linux")]
+impl From<RemoteFsFileType> for fuser::FileType {
+    fn from(r: RemoteFsFileType) -> Self {
+        match r {
+            RemoteFsFileType::Directory => FileType::Directory,
+            RemoteFsFileType::RegularFile => FileType::RegularFile,
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct FileMetadata {
     pub ino: u64,
@@ -17,7 +27,7 @@ pub struct FileMetadata {
     pub mtime: u64,
     pub ctime: u64,
     pub crtime: Option<u64>,
-    pub file_type: FileType,
+    pub file_type: RemoteFsFileType,
     pub permissions: u16,
     pub nlink: u32,
     pub uid: u32,
@@ -26,8 +36,8 @@ pub struct FileMetadata {
     pub flags: Option<u32>,
 }
 
-#[cfg(target_os = "linux")]
 impl FileMetadata {
+    #[cfg(target_os = "linux")]
     pub fn to_file_attr(&self) -> FileAttr {
         FileAttr {
             ino: self.ino,
@@ -37,7 +47,7 @@ impl FileMetadata {
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.mtime),
             ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.ctime),
             crtime: SystemTime::UNIX_EPOCH + Duration::from_secs(self.crtime.unwrap_or(self.ctime)),
-            kind: self.file_type,
+            kind: fuser::FileType::from(self.file_type.clone()),
             perm: self.permissions,
             nlink: self.nlink,
             uid: self.uid,
@@ -49,24 +59,24 @@ impl FileMetadata {
     }
 }
 
-// Versione Windows: solo i campi base, senza tipi FUSE
-#[cfg(target_os = "windows")]
-use serde::Deserialize;
-#[cfg(target_os = "windows")]
-#[derive(Deserialize, Debug, Clone)]
-pub struct FileMetadata {
-    pub ino: u64,
-    pub size: u64,
-    pub blocks: u64,
-    pub atime: u64,
-    pub mtime: u64,
-    pub ctime: u64,
-    pub crtime: Option<u64>,
-    pub file_type: String,
-    pub permissions: u16,
-    pub nlink: u32,
-    pub uid: u32,
-    pub gid: u32,
-    pub blksize: u32,
-    pub flags: Option<u32>,
-}
+// // Versione Windows: solo i campi base, senza tipi FUSE
+// #[cfg(target_os = "windows")]
+// use serde::Deserialize;
+// #[cfg(target_os = "windows")]
+// #[derive(Deserialize, Debug, Clone)]
+// pub struct FileMetadata {
+//     pub ino: u64,
+//     pub size: u64,
+//     pub blocks: u64,
+//     pub atime: u64,
+//     pub mtime: u64,
+//     pub ctime: u64,
+//     pub crtime: Option<u64>,
+//     pub file_type: String,
+//     pub permissions: u16,
+//     pub nlink: u32,
+//     pub uid: u32,
+//     pub gid: u32,
+//     pub blksize: u32,
+//     pub flags: Option<u32>,
+// }
