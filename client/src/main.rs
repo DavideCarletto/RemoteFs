@@ -263,11 +263,12 @@ mod windows_main {
 
         let fs = WinFspRemoteFs::new(api_url, drive_letter.clone());
 
-        info!("Filesystem Windows pronto! Premi CTRL+C per uscire");
+        // Avvia il mount WinFsp
+        fs.mount();
 
-        super::wait_for_shutdown(shutdown_flag);
+        info!("Filesystem Windows terminato!");
 
-        perform_graceful_shutdown(fs);
+        // perform_graceful_shutdown(fs);
     }
 
     fn perform_graceful_shutdown(fs: WinFspRemoteFs) {
