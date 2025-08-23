@@ -1,9 +1,9 @@
-#[cfg(target_os = "linux")]
-use fuser::{Filesystem};
-use log::{debug, error, info, warn};
-use std::time::{Duration, SystemTime};
-use serde_json::json;
 use crate::client::RemoteFsClient;
+#[cfg(target_os = "linux")]
+use fuser::Filesystem;
+use log::{debug, error, info, warn};
+use serde_json::json;
+use std::time::{Duration, SystemTime};
 
 const MAX_NAME_LENGTH: u32 = 255;
 
@@ -18,7 +18,7 @@ impl FuseRemoteFs {
         debug!("Inizializzazione FuseRemoteFs per API: {}", api_url);
 
         let client = RemoteFsClient::new(api_url);
-        
+
         Self { client }
     }
 
@@ -38,7 +38,6 @@ impl Filesystem for FuseRemoteFs {
         _req: &fuser::Request<'_>,
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
-
         match self.client.test_connection() {
             Ok(_) => {
                 config.set_max_readahead(1024 * 1024).ok();
@@ -54,7 +53,6 @@ impl Filesystem for FuseRemoteFs {
         }
     }
     fn destroy(&mut self) {
-        
         debug!("Cache stats: {:?}", self.client.cache().get_stats());
 
         info!("Filesystem remoto smontato e distrutto");
@@ -134,7 +132,10 @@ impl Filesystem for FuseRemoteFs {
         match self.client.get_file_metadata(&path) {
             Some(metadata) => {
                 let file_attr = metadata.to_file_attr();
-                info!("Recuperati attributi per inode {:#x?}: {:?}", ino, file_attr);
+                info!(
+                    "Recuperati attributi per inode {:#x?}: {:?}",
+                    ino, file_attr
+                );
                 reply.attr(&std::time::Duration::from_secs(1), &file_attr);
             }
             None => {
@@ -162,8 +163,10 @@ impl Filesystem for FuseRemoteFs {
         flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
-        debug!("setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, atime: {:?}, mtime: {:?}, flags: {:?})",
-            ino, mode, uid, gid, size, atime, mtime, flags);
+        debug!(
+            "setattr(ino: {:#x?}, mode: {:?}, uid: {:?}, gid: {:?}, size: {:?}, atime: {:?}, mtime: {:?}, flags: {:?})",
+            ino, mode, uid, gid, size, atime, mtime, flags
+        );
 
         let path = match self.client.inode_to_path(ino) {
             Some(p) => p,
@@ -207,13 +210,22 @@ impl Filesystem for FuseRemoteFs {
         });
 
         if let Some(atime) = atime_secs {
-            updates.as_object_mut().unwrap().insert("atime".to_string(), json!(atime));
+            updates
+                .as_object_mut()
+                .unwrap()
+                .insert("atime".to_string(), json!(atime));
         }
         if let Some(mtime) = mtime_secs {
-            updates.as_object_mut().unwrap().insert("mtime".to_string(), json!(mtime));
+            updates
+                .as_object_mut()
+                .unwrap()
+                .insert("mtime".to_string(), json!(mtime));
         }
 
-        match self.client.update_file_attributes(path.as_str(), updates.clone()) {
+        match self
+            .client
+            .update_file_metadata(path.as_str(), updates.clone())
+        {
             Some(metadata) => {
                 let file_attr = metadata.to_file_attr();
                 info!("Attributi aggiornati per {}: {:?}", path, file_attr);
@@ -222,6 +234,82 @@ impl Filesystem for FuseRemoteFs {
             None => {
                 debug!("Impossibile aggiornare attributi per {}: {}", path, updates);
                 reply.error(libc::ENOENT);
+            }
+        }
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        umask: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        debug!(
+            "mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
+            parent, name, mode, umask
+        );
+
+        if name.len() > MAX_NAME_LENGTH as usize {
+            reply.error(libc::ENAMETOOLONG);
+            return;
+        }
+
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Nome directory non valido per mkdir: {:?}", name);
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        let full_path = match self.client.build_path(parent, name_str) {
+            Some(path) => path,
+            None => {
+                error!(
+                    "Impossibile costruire percorso per mkdir: parent {} + {}",
+                    parent, name_str
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let effective_mode = mode & !umask;
+
+        let current_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+
+        let attrs = json!({
+            "path": full_path,
+            "file_type": "Directory",
+            "mode": effective_mode,
+            "uid": _req.uid(),
+            "gid": _req.gid(),
+            "umask": umask,
+            "atime": current_time,
+            "mtime": current_time,
+            "ctime": current_time,
+            "crtime": current_time
+        });
+
+        match self.client.create_filesystem_object(attrs) {
+            Ok(metadata) => {
+                let file_attr = metadata.to_file_attr();
+                info!("Directory creata: {} -> inode {}", full_path, metadata.ino);
+                reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
+            }
+            Err(error_code) => {
+                error!(
+                    "Errore durante la creazione della directory {}: {}",
+                    full_path, error_code
+                );
+                reply.error(error_code);
             }
         }
     }
@@ -269,7 +357,11 @@ impl Filesystem for FuseRemoteFs {
 
         let file_type = match mode & libc::S_IFMT {
             libc::S_IFREG => "RegularFile",
-            libc::S_IFDIR => "Directory",
+            libc::S_IFDIR => {
+                error!("Usa mkdir per creare directory in mknod");
+                reply.error(libc::EINVAL);
+                return;
+            }
             libc::S_IFLNK => "Symlink",
             libc::S_IFBLK => "BlockDevice",
             libc::S_IFCHR => "CharDevice",
@@ -282,87 +374,42 @@ impl Filesystem for FuseRemoteFs {
             }
         };
 
-        let permissions = mode & !libc::S_IFMT;
-        match self.client.create_filesystem_object(
-            &full_path,
-            file_type,
-            permissions,
-            _req.uid(),
-            _req.gid(),
-            rdev,
-            umask,
-        ) {
+        let effective_mode = mode & !umask;
+
+        let current_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+
+        let attrs = json!({
+            "path": full_path,
+            "file_type": file_type,
+            "mode": effective_mode,
+            "uid": _req.uid(),
+            "gid": _req.gid(),
+            "rdev": rdev,
+            "size": 0,
+            "permissions": effective_mode,
+            "atime": current_time,
+            "mtime": current_time,
+            "ctime": current_time,
+            "crtime": current_time,
+            "blocks": 0,
+            "blksize": 512,
+            "nlink": 1
+        });
+
+        match self.client.create_filesystem_object(attrs) {
             Ok(metadata) => {
                 let file_attr = metadata.to_file_attr();
                 info!("File creato: {} -> inode {}", full_path, metadata.ino);
                 reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
             }
             Err(error_code) => {
-                error!("Errore durante la creazione del file {}: {}", full_path, error_code);
-                reply.error(error_code);
-            }
-        }
-    }
-
-    fn mkdir(
-        &mut self,
-        _req: &fuser::Request<'_>,
-        parent: u64,
-        name: &std::ffi::OsStr,
-        mode: u32,
-        umask: u32,
-        reply: fuser::ReplyEntry,
-    ) {
-        debug!(
-            "mkdir(parent: {:#x?}, name: {:?}, mode: {}, umask: {:#x?})",
-            parent, name, mode, umask
-        );
-
-        if name.len() > MAX_NAME_LENGTH as usize {
-            reply.error(libc::ENAMETOOLONG);
-            return;
-        }
-
-        let name_str = match name.to_str() {
-            Some(s) => s,
-            None => {
-                error!("Nome directory non valido per mkdir: {:?}", name);
-                reply.error(libc::EINVAL);
-                return;
-            }
-        };
-
-        let full_path = match self.client.build_path(parent, name_str) {
-            Some(path) => path,
-            None => {
                 error!(
-                    "Impossibile costruire percorso per mkdir: parent {} + {}",
-                    parent, name_str
+                    "Errore durante la creazione del file {}: {}",
+                    full_path, error_code
                 );
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        let file_type = "Directory";
-        let permissions = mode & !libc::S_IFMT;
-
-        match self.client.create_filesystem_object(
-            &full_path,
-            file_type,
-            permissions,
-            _req.uid(),
-            _req.gid(),
-            0,
-            umask,
-        ) {
-            Ok(metadata) => {
-                let file_attr = metadata.to_file_attr();
-                info!("Directory creata: {} -> inode {}", full_path, metadata.ino);
-                reply.entry(&std::time::Duration::from_secs(1), &file_attr, 0);
-            }
-            Err(error_code) => {
-                error!("Errore durante la creazione della directory {}: {}", full_path, error_code);
                 reply.error(error_code);
             }
         }
@@ -409,7 +456,10 @@ impl Filesystem for FuseRemoteFs {
                 reply.ok();
             }
             Err(error_code) => {
-                error!("Errore durante la rimozione del file {}: {}", full_path, error_code);
+                error!(
+                    "Errore durante la rimozione del file {}: {}",
+                    full_path, error_code
+                );
                 reply.error(error_code);
             }
         }
@@ -456,7 +506,10 @@ impl Filesystem for FuseRemoteFs {
                 reply.ok();
             }
             Err(error_code) => {
-                error!("Errore durante la rimozione della directory {}: {}", full_path, error_code);
+                error!(
+                    "Errore durante la rimozione della directory {}: {}",
+                    full_path, error_code
+                );
                 reply.error(error_code);
             }
         }
@@ -533,7 +586,10 @@ impl Filesystem for FuseRemoteFs {
                 reply.ok();
             }
             Err(error_code) => {
-                error!("Errore durante la rimozione del file {}: {}", old_path, error_code);
+                error!(
+                    "Errore durante la rimozione del file {}: {}",
+                    old_path, error_code
+                );
                 reply.error(error_code);
             }
         }
@@ -560,7 +616,10 @@ impl Filesystem for FuseRemoteFs {
                 reply.opened(file_handle, 0);
             }
             Err(error_code) => {
-                error!("Errore durante l'apertura del file {}: {}", path, error_code);
+                error!(
+                    "Errore durante l'apertura del file {}: {}",
+                    path, error_code
+                );
                 reply.error(error_code);
             }
         }
@@ -600,7 +659,10 @@ impl Filesystem for FuseRemoteFs {
                 reply.data(&data);
             }
             Err(error_code) => {
-                error!("Errore durante la lettura del file {}: {}", path, error_code);
+                error!(
+                    "Errore durante la lettura del file {}: {}",
+                    path, error_code
+                );
                 reply.error(error_code);
             }
         }
@@ -647,7 +709,10 @@ impl Filesystem for FuseRemoteFs {
                 reply.written(bytes_written);
             }
             Err(error_code) => {
-                error!("Errore durante la scrittura del file {}: {}", path, error_code);
+                error!(
+                    "Errore durante la scrittura del file {}: {}",
+                    path, error_code
+                );
                 reply.error(error_code);
             }
         }
@@ -690,13 +755,14 @@ impl Filesystem for FuseRemoteFs {
 
         // Prima verifica che la directory esista
         match self.client.get_file_metadata(&path) {
-            Some(metadata) if fuser::FileType::from(metadata.file_type.clone()) == fuser::FileType::Directory => {
-            },
+            Some(metadata)
+                if fuser::FileType::from(metadata.file_type.clone())
+                    == fuser::FileType::Directory => {}
             Some(_) => {
                 error!("Path {} non è una directory", path);
                 reply.error(libc::ENOTDIR);
                 return;
-            },
+            }
             None => {
                 error!("Directory {} non trovata", path);
                 reply.error(libc::ENOENT);
@@ -875,38 +941,52 @@ impl Filesystem for FuseRemoteFs {
             return;
         }
 
-        match self.client.create_filesystem_object(
-            &full_path,
-            file_type,
-            permissions,
-            _req.uid(),
-            _req.gid(),
-            0,
-            umask,
-        ) {
-            Ok(metadata) => {
-                match self.client.open_file(&full_path, effective_flags) {
-                    Ok(file_handle) => {
-                        let file_attr = metadata.to_file_attr();
-                        info!(
-                            "File creato e aperto: {} -> inode {}, handle {}",
-                            full_path, metadata.ino, file_handle
-                        );
-                        reply.created(
-                            &std::time::Duration::from_secs(1),
-                            &file_attr,
-                            0,
-                            file_handle,
-                            0,
-                        );
-                    }
-                    Err(error_code) => {
-                        error!("Errore apertura file dopo creazione: {}", full_path);
-                        let _ = self.client.remove_filesystem_object(&full_path, false);
-                        reply.error(error_code);
-                    }
+        let current_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs();
+
+        // Costruisci request_data come JSON flessibile
+        let attrs = json!({
+            "path": full_path,
+            "file_type": file_type,
+            "mode": effective_mode,
+            "uid": _req.uid(),
+            "gid": _req.gid(),
+            "rdev": 0,
+            "size": 0,
+            "permissions": permissions,
+            "atime": current_time,
+            "mtime": current_time,
+            "ctime": current_time,
+            "crtime": current_time,
+            "blocks": 0,
+            "blksize": 512,
+            "nlink": 1
+        });
+
+        match self.client.create_filesystem_object(attrs) {
+            Ok(metadata) => match self.client.open_file(&full_path, effective_flags) {
+                Ok(file_handle) => {
+                    let file_attr = metadata.to_file_attr();
+                    info!(
+                        "File creato e aperto: {} -> inode {}, handle {}",
+                        full_path, metadata.ino, file_handle
+                    );
+                    reply.created(
+                        &std::time::Duration::from_secs(1),
+                        &file_attr,
+                        0,
+                        file_handle,
+                        0,
+                    );
                 }
-            }
+                Err(error_code) => {
+                    error!("Errore apertura file dopo creazione: {}", full_path);
+                    let _ = self.client.remove_filesystem_object(&full_path, false);
+                    reply.error(error_code);
+                }
+            },
             Err(error_code) => {
                 reply.error(error_code);
             }
@@ -933,7 +1013,10 @@ impl Filesystem for FuseRemoteFs {
         size: u32,
         reply: fuser::ReplyXattr,
     ) {
-        debug!("getxattr(ino: {:#x}, name: {:?}, size: {})", _ino, name, size);
+        debug!(
+            "getxattr(ino: {:#x}, name: {:?}, size: {})",
+            _ino, name, size
+        );
         reply.error(libc::ENODATA);
     }
 
@@ -964,7 +1047,11 @@ impl Filesystem for FuseRemoteFs {
     ) {
         debug!(
             "setxattr(ino: {:#x}, name: {:?}, value_len: {}, flags: {}, position: {})",
-            _ino, name, value.len(), flags, position
+            _ino,
+            name,
+            value.len(),
+            flags,
+            position
         );
         reply.error(libc::ENOTSUP);
     }
@@ -988,7 +1075,10 @@ impl Filesystem for FuseRemoteFs {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!("fsync(ino: {:#x}, fh: {}, datasync: {})", _ino, _fh, _datasync);
+        debug!(
+            "fsync(ino: {:#x}, fh: {}, datasync: {})",
+            _ino, _fh, _datasync
+        );
         reply.ok();
     }
 
@@ -1000,7 +1090,10 @@ impl Filesystem for FuseRemoteFs {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!("fsyncdir(ino: {:#x}, fh: {}, datasync: {})", _ino, _fh, _datasync);
+        debug!(
+            "fsyncdir(ino: {:#x}, fh: {}, datasync: {})",
+            _ino, _fh, _datasync
+        );
         reply.ok();
     }
 
