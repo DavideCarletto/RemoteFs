@@ -12,7 +12,7 @@ pub struct WinFspRemoteFs {
 impl WinFspRemoteFs {
     pub fn new(api_url: String, drive_letter: String) -> Self {
         info!(
-            "🪟 Inizializzazione WinFspRemoteFs per API: {} su unità {}",
+            "Inizializzazione WinFspRemoteFs per API: {} su unità {}",
             api_url, drive_letter
         );
 
