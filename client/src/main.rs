@@ -1,7 +1,10 @@
-use clap::{Command as ClapCommand};
-use log::{info, warn, error};
+use clap::Command as ClapCommand;
 use colored::*;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use log::{error, info, warn};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
@@ -34,19 +37,20 @@ fn setup_logging(log_to_file: Option<String>, level: log::LevelFilter) {
         .level(level);
 
     let dispatch = if let Some(file_path) = log_to_file {
-        base_dispatch.chain(std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(file_path)
-            .unwrap())
+        base_dispatch.chain(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(file_path)
+                .unwrap(),
+        )
     } else {
         base_dispatch.chain(std::io::stdout())
     };
 
     dispatch.apply().unwrap();
 }
-
 
 fn setup_graceful_shutdown() -> Arc<AtomicBool> {
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -55,7 +59,8 @@ fn setup_graceful_shutdown() -> Arc<AtomicBool> {
     ctrlc::set_handler(move || {
         warn!("Ricevuto segnale di shutdown (CTRL+C)");
         shutdown_flag_clone.store(true, Ordering::SeqCst);
-    }).expect("Errore nel setup del signal handler");
+    })
+    .expect("Errore nel setup del signal handler");
 
     shutdown_flag
 }
@@ -69,12 +74,97 @@ fn wait_for_shutdown(shutdown_flag: Arc<AtomicBool>) {
 fn parse_common_args(cmd: &mut ClapCommand) -> (String,) {
     let matches = cmd.clone().get_matches();
 
-    let api_url: String = matches
-        .get_one::<String>("api-url")
-        .unwrap()
-        .to_string();
+    let api_url: String = matches.get_one::<String>("api-url").unwrap().to_string();
 
     (api_url,)
+}
+fn handle_mount_error(error_msg: &str, exit_code: i32) -> ! {
+    error!("{}", error_msg);
+    std::process::exit(exit_code);
+}
+
+fn log_startup_info(platform: &str, target: &str) {
+    info!("=== Remote-FS Client {} ===", platform);
+    info!("Montaggio su: {}", target);
+    info!("Premi CTRL+C per uscire...");
+}
+
+fn log_shutdown_info(platform: &str) {
+    info!("=== Shutdown {} ===", platform);
+}
+
+fn final_cleanup_and_exit(success: bool) {
+    if success {
+        info!("Graceful shutdown completato!");
+        std::process::exit(0);
+    } else {
+        error!("Shutdown con errori");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn daemonize_process() {
+    use daemonize::Daemonize;
+
+    let daemonize = Daemonize::new()
+        .pid_file("/tmp/remote-fs-client.pid")
+        .working_directory("/");
+
+    match daemonize.start() {
+        Ok(_) => info!("Daemon avviato con successo"),
+        Err(e) => {
+            error!("Errore nel daemonizzare: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn perform_graceful_shutdown_linux(
+    mountpoint: &str,
+    daemon_mode: bool,
+    mount_handle: std::thread::JoinHandle<()>,
+) {
+    log_shutdown_info("Linux");
+
+    let unmount_result = std::process::Command::new("fusermount")
+        .args(["-u", mountpoint])
+        .output();
+
+    match unmount_result {
+        Ok(output) if output.status.success() => {
+            info!("Filesystem smontato con successo");
+        }
+        Ok(output) => {
+            error!(
+                "Unmount fallito: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(e) => error!("Errore comando unmount: {}", e),
+    }
+
+    if daemon_mode {
+        if let Err(e) = std::fs::remove_file("/tmp/remote-fs-client.pid") {
+            error!("Errore rimozione PID file: {}", e);
+        } else {
+            info!("PID file rimosso");
+        }
+    }
+
+    let join_result = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        mount_handle.join()
+    })
+    .join();
+
+    match join_result {
+        Ok(_) => info!("Mount thread terminato"),
+        Err(_) => warn!("Mount thread timeout"),
+    }
+
+    final_cleanup_and_exit(true);
 }
 
 #[cfg(target_os = "linux")]
@@ -82,15 +172,11 @@ mod linux_main {
     use super::*;
     use clap::{Arg, Command as ClapCommand};
     use fuser::MountOption;
-    use std::{fs::create_dir_all, io::ErrorKind};
-    use daemonize::Daemonize;
     use remote_fs::FuseRemoteFs;
+    use std::{fs::create_dir_all, io::ErrorKind};
 
     pub fn run() {
-        let mut cmd = ClapCommand::new("remote-fs-client")
-            .version("0.1.0")
-            .author("Davide Carletto & Michele Carena")
-            .about("Client filesystem remoto modulare con architettura backend")
+        let mut cmd = create_base_command("Linux con FUSE")
             .arg(
                 Arg::new("mount-point")
                     .long("mount-point")
@@ -103,36 +189,40 @@ mod linux_main {
                     .long("daemon")
                     .action(clap::ArgAction::SetTrue)
                     .help("Run the client as a daemon in background"),
-            )
-            .arg(
-                Arg::new("api-url")
-                    .long("api-url")
-                    .value_name("URL")
-                    .default_value("http://localhost:3000")
-                    .help("URL del server RemoteFS"),
             );
 
         let (api_url,) = super::parse_common_args(&mut cmd);
-
         let matches = cmd.get_matches();
 
         let mountpoint: String = matches
-            .get_one::<String>("mount-point").unwrap()
+            .get_one::<String>("mount-point")
+            .unwrap()
             .to_string();
 
         let run_daemon = matches.get_flag("daemon");
 
+        // Setup comune
         let log_file = run_daemon.then(|| "/tmp/remote-fs-client.log".to_string());
-        super::setup_logging(log_file, if run_daemon { log::LevelFilter::Info } else { log::LevelFilter::Debug });
+        super::setup_logging(
+            log_file,
+            if run_daemon {
+                log::LevelFilter::Info
+            } else {
+                log::LevelFilter::Debug
+            },
+        );
 
         if run_daemon {
-            daemonize_process();
+            super::daemonize_process();
         }
 
         let shutdown_flag = super::setup_graceful_shutdown();
 
-        create_dir_all(&mountpoint).unwrap();
+        // Log di avvio comune
+        super::log_startup_info("Linux FUSE", &mountpoint);
 
+        // Logica specifica Linux
+        create_dir_all(&mountpoint).unwrap();
         let fs = FuseRemoteFs::new(api_url);
         info!("Cache configurata con successo");
 
@@ -146,78 +236,40 @@ mod linux_main {
         let mount_handle = std::thread::spawn(move || {
             let result = fuser::mount2(fs, mountpoint_clone, &options);
             if let Err(e) = result {
-                if e.kind() == ErrorKind::PermissionDenied {
-                    error!("Permessi insufficienti: {}", e);
-                    std::process::exit(2);
+                let error_msg = if e.kind() == ErrorKind::PermissionDenied {
+                    format!("Permessi insufficienti: {}", e)
                 } else {
-                    error!("Errore mount: {}", e);
-                    std::process::exit(1);
-                }
+                    format!("Errore mount: {}", e)
+                };
+                super::handle_mount_error(
+                    &error_msg,
+                    if e.kind() == ErrorKind::PermissionDenied {
+                        2
+                    } else {
+                        1
+                    },
+                );
             }
         });
 
-        info!("Filesystem montato con successo! Premi CTRL+C per uscire.");
-
+        info!("Filesystem montato con successo!");
         super::wait_for_shutdown(shutdown_flag);
 
-        perform_graceful_shutdown(&mountpoint, run_daemon, mount_handle);
+        super::perform_graceful_shutdown_linux(&mountpoint, run_daemon, mount_handle);
     }
 
-    fn daemonize_process() {
-        let daemonize = Daemonize::new()
-            .pid_file("/tmp/remote-fs-client.pid")
-            .working_directory("/");
-
-        match daemonize.start() {
-            Ok(_) => info!("Daemon avviato con successo"),
-            Err(e) => {
-                error!("Errore nel daemonizzare: {}", e);
-                std::process::exit(1);
-            }
-        }
-    }
-
-    fn perform_graceful_shutdown(
-        mountpoint: &str,
-        daemon_mode: bool,
-        mount_handle: std::thread::JoinHandle<()>,
-    ) {
-
-        let unmount_result = std::process::Command::new("fusermount")
-            .args(["-u", mountpoint])
-            .output();
-
-        match unmount_result {
-            Ok(output) if output.status.success() => {
-                info!("Filesystem smontato con successo");
-            }
-            Ok(output) => {
-                error!("Unmount fallito: {}", String::from_utf8_lossy(&output.stderr));
-            }
-            Err(e) => error!("Errore comando unmount: {}", e),
-        }
-
-        if daemon_mode {
-            if let Err(e) = std::fs::remove_file("/tmp/remote-fs-client.pid") {
-                error!("Errore rimozione PID file: {}", e);
-            } else {
-                info!("PID file rimosso");
-            }
-        }
-
-        let join_result = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(2));
-            mount_handle.join()
-        })
-        .join();
-
-        match join_result {
-            Ok(_) => info!("Mount thread terminato"),
-            Err(_) => warn!("Mount thread timeout"),
-        }
-
-        info!("Graceful shutdown completato!");
-        std::process::exit(0);
+    fn create_base_command(description: &str) -> ClapCommand {
+        ClapCommand::new("remote-fs-client")
+            .version("0.1.0")
+            .author("Davide Carletto & Michele Carena")
+            .about(&format!("Client filesystem remoto {}", description))
+            .arg(
+                Arg::new("api-url")
+                    .long("api-url")
+                    .value_name("URL")
+                    .default_value("http://localhost:3000")
+                    .help("URL del server RemoteFS"),
+            )
     }
 }
 
@@ -225,31 +277,18 @@ mod linux_main {
 mod windows_main {
     use super::*;
     use clap::{Arg, Command as ClapCommand};
-    use log::error;
     use remote_fs::backends::WinFspRemoteFs;
 
     pub fn run() {
-        let mut cmd = ClapCommand::new("remote-fs-client")
-            .version("0.1.0")
-            .author("Davide Carletto & Michele Carena")
-            .about("Client filesystem remoto Windows con WinFSP")
-            .arg(
-                Arg::new("drive-letter")
-                    .long("drive-letter")
-                    .value_name("DRIVE")
-                    .default_value("R:")
-                    .help("Lettera del drive per il mount Windows"),
-            )
-            .arg(
-                Arg::new("api-url")
-                    .long("api-url")
-                    .value_name("URL")
-                    .default_value("http://localhost:3000")
-                    .help("URL del server RemoteFS"),
-            );
+        let mut cmd = create_base_command("Windows con WinFSP").arg(
+            Arg::new("drive-letter")
+                .long("drive-letter")
+                .value_name("DRIVE")
+                .default_value("R:")
+                .help("Lettera del drive per il mount Windows"),
+        );
 
         let (api_url,) = super::parse_common_args(&mut cmd);
-
         let matches = cmd.get_matches();
 
         let drive_letter: String = matches
@@ -258,27 +297,40 @@ mod windows_main {
             .to_string();
 
         super::setup_logging(None, log::LevelFilter::Debug);
+        let _shutdown_flag = super::setup_graceful_shutdown();
 
-        let shutdown_flag = super::setup_graceful_shutdown();
+        super::log_startup_info("Windows WinFSP", &drive_letter);
 
         let fs = WinFspRemoteFs::new(api_url, drive_letter.clone());
 
-        // Avvia il mount WinFsp
-        fs.mount();
-
-        info!("Filesystem Windows terminato!");
-
-        // perform_graceful_shutdown(fs);
-    }
-
-    fn perform_graceful_shutdown(fs: WinFspRemoteFs) {
-
-        if let Err(e) = fs.unmount() {
-            error!("Errore unmount Windows: {}", e);
+        if let Err(e) = fs.mount() {
+            super::handle_mount_error(&format!("Errore mount Windows: {}", e), 1);
         }
 
-        info!("Graceful shutdown Windows completato!");
-        std::process::exit(0);
+        info!("Filesystem Windows terminato!");
+        perform_graceful_shutdown_windows();
+    }
+
+    fn create_base_command(description: &str) -> ClapCommand {
+        ClapCommand::new("remote-fs-client")
+            .version("0.1.0")
+            .author("Davide Carletto & Michele Carena")
+            .about(&format!("Client filesystem remoto {}", description))
+            .arg(
+                Arg::new("api-url")
+                    .long("api-url")
+                    .value_name("URL")
+                    .default_value("http://localhost:3000")
+                    .help("URL del server RemoteFS"),
+            )
+    }
+
+    fn perform_graceful_shutdown_windows() {
+        super::log_shutdown_info("Windows");
+
+        info!("Cleanup Windows completato");
+
+        super::final_cleanup_and_exit(true);
     }
 }
 

@@ -202,7 +202,6 @@ app.post('/files', (req, res) => {
     if (!parentIno) {
       return res.status(404).json({ error: "Directory padre non trovata" });
     }
-    
     const name = path.split('/').pop() || path;
     const ino = sqliteBackend.createFile({
       path,

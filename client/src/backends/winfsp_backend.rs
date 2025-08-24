@@ -1,18 +1,18 @@
-use crate::client::RemoteFsClient;
-use log::info;
+#[cfg(target_os = "windows")]
 use std::{
     collections::HashMap,
-    ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+use crate::{client::RemoteFsClient, types::RemoteFsFileType};
+use log::{error, info};
 use winfsp_wrs::{
-    filetime_now, u16cstr, u16str, CleanupFlags, CreateFileInfo, CreateOptions, DirInfo,
-    FileAccessRights, FileAttributes, FileInfo, FileSystem, FileSystemInterface,
-    PSecurityDescriptor, Params, SecurityDescriptor, U16CStr, U16CString, U16Str, VolumeInfo,
-    VolumeParams, WriteMode, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY,
-    STATUS_END_OF_FILE, STATUS_MEDIA_WRITE_PROTECTED, STATUS_NOT_A_DIRECTORY,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    CleanupFlags, CreateFileInfo, CreateOptions, DirInfo, FileAccessRights, FileAttributes,
+    FileInfo, FileSystem, FileSystemInterface, NTSTATUS, PSecurityDescriptor, Params,
+    STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_INVALID_HANDLE,
+    STATUS_MEDIA_WRITE_PROTECTED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+    SecurityDescriptor, U16CStr, U16CString, VolumeInfo, VolumeParams, WriteMode, filetime_now,
+    u16cstr,
 };
 
 macro_rules! debug {
@@ -23,13 +23,19 @@ macro_rules! debug {
 /// Implementazione WinFSP del filesystem remoto
 #[cfg(target_os = "windows")]
 pub struct WinFspRemoteFs {
-    client: RemoteFsClient,
+    client: Mutex<RemoteFsClient>,
+    handle_to_path: Arc<Mutex<HashMap<u64, String>>>,
     drive_letter: String,
 }
 
 #[cfg(target_os = "windows")]
 impl WinFspRemoteFs {
     pub fn new(api_url: String, drive_letter: String) -> Self {
+        use std::{
+            collections::HashMap,
+            sync::{Arc, Mutex},
+        };
+
         info!(
             "Inizializzazione WinFspRemoteFs per API: {} su unità {}",
             api_url, drive_letter
@@ -38,19 +44,24 @@ impl WinFspRemoteFs {
         let client = RemoteFsClient::new(api_url);
 
         Self {
-            client,
+            client: Mutex::new(client),
+            handle_to_path: Arc::new(Mutex::new(HashMap::new())),
             drive_letter,
         }
     }
 
     /// Ottiene un riferimento al client
-    pub fn client(&self) -> &RemoteFsClient {
-        &self.client
+    pub fn client(&self) -> std::sync::MutexGuard<'_, RemoteFsClient> {
+        self.client
+            .lock()
+            .expect("Failed to lock RemoteFsClient mutex")
     }
 
     /// Ottiene un riferimento mutabile al client
-    pub fn client_mut(&mut self) -> &mut RemoteFsClient {
-        &mut self.client
+    pub fn client_mut(&mut self) -> std::sync::MutexGuard<'_, RemoteFsClient> {
+        self.client
+            .lock()
+            .expect("Failed to lock RemoteFsClient mutex")
     }
 
     /// Ottiene la lettera del drive
@@ -62,385 +73,128 @@ impl WinFspRemoteFs {
         todo!();
     }
 
-    /// Monta il filesystem WinFsp in memoria sulla lettera di drive specificata
-    pub fn mount(&self) {
-        // Inizializza WinFsp
+    pub fn mount(self) -> Result<(), String> {
+        // Cambia da &mut self a self
         winfsp_wrs::init().expect("Impossibile inizializzare WinFsp");
 
-        // Costruisci il mountpoint (es: "X:")
         let mountpoint = format!("{}:", self.drive_letter.trim_end_matches(':'));
         println!("Montaggio filesystem su {}", mountpoint);
 
-        // Crea il filesystem in memoria
-        let fs = {
-            let mountpoint_u16 = U16CString::from_str(&mountpoint).expect("Mountpoint non valido");
-            let mut volume_params = VolumeParams::default();
-            volume_params
-                .set_sector_size(512)
-                .set_sectors_per_allocation_unit(1)
-                .set_volume_creation_time(filetime_now())
-                .set_volume_serial_number(0)
-                .set_file_info_timeout(1000)
-                .set_case_sensitive_search(true)
-                .set_case_preserved_names(true)
-                .set_unicode_on_disk(true)
-                .set_persistent_acls(true)
-                .set_post_cleanup_when_modified_only(true)
-                .set_file_system_name(u16cstr!("memfs"))
-                .unwrap()
-                .set_prefix(u16cstr!(""))
-                .unwrap();
-            let params = Params {
-                volume_params,
-                ..Default::default()
-            };
-            FileSystem::start(
-                params,
-                Some(&mountpoint_u16),
-                MemFs::new(u16str!("memfs"), false),
-            ).expect("Impossibile avviare il filesystem")
+        let mountpoint_u16 = U16CString::from_str(&mountpoint).expect("Mountpoint non valido");
+        let mut volume_params = VolumeParams::default();
+        volume_params
+            .set_sector_size(512)
+            .set_sectors_per_allocation_unit(1)
+            .set_volume_creation_time(filetime_now())
+            .set_volume_serial_number(0)
+            .set_file_info_timeout(1000)
+            .set_case_sensitive_search(true)
+            .set_case_preserved_names(true)
+            .set_unicode_on_disk(true)
+            .set_persistent_acls(true)
+            .set_post_cleanup_when_modified_only(true)
+            .set_file_system_name(u16cstr!("remotefs"))
+            .unwrap()
+            .set_prefix(u16cstr!(""))
+            .unwrap();
+
+        let params = Params {
+            volume_params,
+            ..Default::default()
         };
 
-        println!("Filesystem montato su {}! Premi INVIO per smontare...", mountpoint);
+        // Ora passa self (ownership completo)
+        let fs =
+            FileSystem::start(params, Some(&mountpoint_u16), self).map_err(|e| e.to_string())?;
+
+        println!(
+            "Filesystem montato su {}! Premi INVIO per smontare...",
+            mountpoint
+        );
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
         println!("Smontaggio filesystem...");
         fs.stop();
+
+        Ok(())
     }
 }
 
-
-enum Obj {
-    Folder(FolderObj),
-    File(FileObj),
-}
-
-impl std::fmt::Debug for Obj {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.path())
-    }
-}
-
-impl Obj {
-    fn path(&self) -> &Path {
-        match self {
-            Self::Folder(folder) => &folder.path,
-            Self::File(file) => &file.path,
-        }
-    }
-    fn set_path(&mut self, path: PathBuf) {
-        match self {
-            Self::Folder(folder) => folder.path = path,
-            Self::File(file) => file.path = path,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FolderObj {
-    path: PathBuf,
-    security_descriptor: SecurityDescriptor,
-    info: FileInfo,
-}
-
-#[derive(Debug, Clone)]
-struct FileObj {
-    path: PathBuf,
-    security_descriptor: SecurityDescriptor,
-    info: FileInfo,
-    data: Vec<u8>,
-}
-
-impl FolderObj {
-    fn new(
-        path: PathBuf,
-        attributes: FileAttributes,
-        security_descriptor: SecurityDescriptor,
-    ) -> Self {
-        let now = filetime_now();
-        let mut info = FileInfo::default();
-
-        info.set_file_attributes(attributes).set_time(now);
-
-        assert!(attributes.is(FileAttributes::DIRECTORY));
-
-        Self {
-            path,
-            security_descriptor,
-            info,
-        }
-    }
-}
-
-impl FileObj {
-    const ALLOCATION_UNIT: usize = 4096;
-
-    fn new(
-        path: PathBuf,
-        attributes: FileAttributes,
-        security_descriptor: SecurityDescriptor,
-        allocation_size: u64,
-    ) -> Self {
-        let now = filetime_now();
-        let mut info = FileInfo::default();
-
-        info.set_allocation_size(allocation_size)
-            .set_file_attributes(attributes | FileAttributes::ARCHIVE)
-            .set_time(now);
-
-        assert!(!attributes.is(FileAttributes::DIRECTORY));
-
-        Self {
-            path,
-            security_descriptor,
-            info,
-            data: vec![0; allocation_size as usize],
-        }
-    }
-
-    fn allocation_size(&self) -> usize {
-        self.data.len()
-    }
-
-    fn set_allocation_size(&mut self, allocation_size: usize) {
-        self.data.resize(allocation_size, 0);
-        self.info
-            .set_file_size(std::cmp::min(self.info.file_size(), allocation_size as u64));
-        self.info.set_allocation_size(allocation_size as u64);
-    }
-
-    fn adapt_allocation_size(&mut self, file_size: usize) {
-        let units = file_size.div_ceil(Self::ALLOCATION_UNIT);
-        self.set_allocation_size(units * Self::ALLOCATION_UNIT)
-    }
-
-    fn set_file_size(&mut self, file_size: usize) {
-        if (file_size as u64) < self.info.file_size() {
-            self.data[file_size..self.info.file_size() as usize].fill(0)
-        }
-        if file_size > self.allocation_size() {
-            self.adapt_allocation_size(file_size)
-        }
-        self.info.set_file_size(file_size as u64);
-    }
-
-    fn read(&self, offset: usize, length: usize) -> &[u8] {
-        let end_offset = std::cmp::min(self.info.file_size() as usize, offset + length);
-
-        &self.data[offset..end_offset]
-    }
-
-    fn write(&mut self, buffer: &[u8], offset: usize) -> usize {
-        let end_offset = offset + buffer.len();
-        if end_offset as u64 > self.info.file_size() {
-            self.set_file_size(end_offset)
-        }
-
-        self.data[offset..end_offset].copy_from_slice(buffer);
-        buffer.len()
-    }
-
-    fn constrained_write(&mut self, buffer: &[u8], offset: usize) -> usize {
-        if offset as u64 >= self.info.file_size() {
-            return 0;
-        }
-
-        let end_offset = std::cmp::min(self.info.file_size() as usize, offset + buffer.len());
-        let transferred_length = end_offset - offset;
-
-        self.data[offset..end_offset].copy_from_slice(&buffer[..transferred_length]);
-
-        transferred_length
-    }
-}
-
-impl From<&Obj> for FileInfo {
-    fn from(value: &Obj) -> Self {
-        match value {
-            Obj::File(file_obj) => file_obj.info,
-            Obj::Folder(folder_obj) => folder_obj.info,
-        }
-    }
-}
-
-impl Obj {
-    fn new_file(
-        path: PathBuf,
-        attributes: FileAttributes,
-        security_descriptor: SecurityDescriptor,
-        allocation_size: u64,
-    ) -> Self {
-        Self::File(FileObj::new(
-            path,
-            attributes,
-            security_descriptor,
-            allocation_size,
-        ))
-    }
-
-    fn new_folder(
-        path: PathBuf,
-        attributes: FileAttributes,
-        security_descriptor: SecurityDescriptor,
-    ) -> Self {
-        Self::Folder(FolderObj::new(path, attributes, security_descriptor))
-    }
-}
-
-#[derive(Debug)]
-struct MemFs {
-    entries: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<Obj>>>>>,
-    volume_info: Arc<Mutex<VolumeInfo>>,
-    read_only: bool,
-    root_path: PathBuf,
-}
-
-impl MemFs {
-    const MAX_FILE_NODES: u64 = 1024;
-    const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
-    const FILE_NODES: u64 = 1;
-
-    fn new(volume_label: &U16Str, read_only: bool) -> Self {
-        let root_path = PathBuf::from("/");
-        let mut entries = HashMap::new();
-
-        let entry = Obj::Folder(FolderObj::new(
-            root_path.clone(),
-            FileAttributes::DIRECTORY,
-            SecurityDescriptor::from_wstr(u16cstr!(
-                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
-            ))
-            .unwrap(),
-        ));
-
-        entries.insert(root_path.clone(), Arc::new(Mutex::new(entry)));
-
-        Self {
-            entries: Arc::new(Mutex::new(entries)),
-            volume_info: Arc::new(Mutex::new(
-                VolumeInfo::new(
-                    Self::MAX_FILE_NODES * Self::MAX_FILE_SIZE,
-                    (Self::MAX_FILE_NODES - Self::FILE_NODES) * Self::MAX_FILE_SIZE,
-                    volume_label,
-                )
-                .expect("volume label too long"),
-            )),
-            read_only,
-            root_path,
-        }
-    }
-
-    fn get_file_info_from_obj(&self, file_context: &Obj) -> Result<FileInfo, NTSTATUS> {
-        match file_context {
-            Obj::File(file_obj) => Ok(file_obj.info),
-            Obj::Folder(folder_obj) => Ok(folder_obj.info),
-        }
-    }
-}
-
-impl FileSystemInterface for MemFs {
-    type FileContext = Arc<Mutex<Obj>>;
-
-    const GET_VOLUME_INFO_DEFINED: bool = true;
-    fn get_volume_info(&self) -> Result<VolumeInfo, NTSTATUS> {
-        debug!("get_volume_info()");
-
-        Ok(self.volume_info.lock().unwrap().clone())
-    }
-
-    const SET_VOLUME_LABEL_DEFINED: bool = true;
-    fn set_volume_label(&self, volume_label: &U16CStr) -> Result<VolumeInfo, NTSTATUS> {
-        debug!("set_volume_label(volume_label: {:?})", volume_label);
-
-        let mut guard = self.volume_info.lock().unwrap();
-
-        guard
-            .set_volume_label(volume_label.as_ustr())
-            .expect("volume label size already checked");
-
-        Ok(guard.clone())
-    }
-
-    const GET_SECURITY_BY_NAME_DEFINED: bool = true;
-    fn get_security_by_name(
-        &self,
-        file_name: &U16CStr,
-        _find_reparse_point: impl Fn() -> Option<FileAttributes>,
-    ) -> Result<(FileAttributes, PSecurityDescriptor, bool), NTSTATUS> {
-        debug!("get_security_by_name(file_name: {:?})", file_name);
-
-        let entries = self.entries.lock().unwrap();
-
-        let file_name = PathBuf::from(file_name.to_os_string());
-
-        if let Some(obj) = entries.get(&file_name) {
-            match obj.lock().unwrap().deref() {
-                Obj::File(file_obj) => Ok((
-                    file_obj.info.file_attributes(),
-                    file_obj.security_descriptor.as_ptr(),
-                    false,
-                )),
-                Obj::Folder(folder_obj) => Ok((
-                    folder_obj.info.file_attributes(),
-                    folder_obj.security_descriptor.as_ptr(),
-                    false,
-                )),
-            }
-        } else {
-            Err(STATUS_OBJECT_NAME_NOT_FOUND)
-        }
-    }
-
+impl FileSystemInterface for WinFspRemoteFs {
     const CREATE_EX_DEFINED: bool = true;
     fn create_ex(
         &self,
         file_name: &U16CStr,
         create_file_info: CreateFileInfo,
-        security_descriptor: SecurityDescriptor,
+        _security_descriptor: SecurityDescriptor,
         _buffer: &[u8],
         _extra_buffer_is_reparse_point: bool,
     ) -> Result<(Self::FileContext, FileInfo), NTSTATUS> {
         debug!(
-            "[WinFSP] create(file_name: {:?}, create_file_info: {:?}, security_descriptor: {:?})",
-            file_name, create_file_info, security_descriptor
+            "[WinFSP] create_ex(file_name: {:?}, create_options: {:?})",
+            file_name, create_file_info.create_options
         );
 
-        if self.read_only {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
-        }
-
-        let mut entries = self.entries.lock().unwrap();
-
-        let file_name = PathBuf::from(file_name.to_os_string());
-
-        // File/Folder already exists
-        if entries.contains_key(&file_name) {
-            return Err(STATUS_OBJECT_NAME_COLLISION);
-        }
-
-        let obj = if create_file_info
+        let path = file_name.to_os_string().to_string_lossy().into_owned();
+        let is_directory = create_file_info
             .create_options
-            .is(CreateOptions::FILE_DIRECTORY_FILE)
-        {
-            Obj::new_folder(
-                file_name.clone(),
-                create_file_info.file_attributes,
-                security_descriptor,
-            )
-        } else {
-            Obj::new_file(
-                file_name.clone(),
-                create_file_info.file_attributes,
-                security_descriptor,
-                create_file_info.allocation_size,
-            )
+            .is(CreateOptions::FILE_DIRECTORY_FILE);
+
+        let (metadata, file_handle) = {
+            let mut client = self.client.lock().unwrap();
+            let normalized_path = client.normalize_path_for_server(&path);
+
+            let attrs = serde_json::json!({
+                "path": normalized_path,
+                "file_type": if is_directory { "Directory" } else { "RegularFile" },
+                "mode": create_file_info.file_attributes.0,
+                "uid": 1000,
+                "gid": 1000,
+                "atime": filetime_now(),
+                "mtime": filetime_now(),
+                "ctime": filetime_now(),
+                "crtime": filetime_now(),
+            });
+
+            match client.create_filesystem_object(attrs) {
+                Ok(metadata) => {
+                    let file_handle = if !is_directory {
+                        match client.open_file(&path, create_file_info.create_options.0 as i32) {
+                            Ok(h) => {
+                                info!("File aperto dopo creazione: {} -> handle {}", path, h);
+                                h
+                            }
+                            Err(_) => {
+                                error!("Impossibile aprire file appena creato: {}", path);
+                                return Err(STATUS_ACCESS_DENIED);
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    (metadata, file_handle)
+                }
+                Err(e) => {
+                    error!("Errore creazione {}: {}", path, e);
+                    return Err(e as NTSTATUS);
+                }
+            }
         };
 
-        let file_info = self.get_file_info_from_obj(&obj)?;
-        let file_context = Arc::new(Mutex::new(obj));
-        entries.insert(file_name, file_context.clone());
+        {
+            let mut handle_map = self.handle_to_path.lock().unwrap();
+            let normalized_path = self.client().normalize_path_for_server(&path); // ← Nuovo lock breve
+            handle_map.insert(file_handle, normalized_path);
+        }
 
-        Ok((file_context, file_info))
+        info!(
+            "{} creato: {} -> handle {}",
+            if is_directory { "Directory" } else { "File" },
+            path,
+            file_handle
+        );
+
+        Ok((file_handle as usize, metadata.to_file_info()))
     }
 
     const OPEN_DEFINED: bool = true;
@@ -448,131 +202,106 @@ impl FileSystemInterface for MemFs {
         &self,
         file_name: &U16CStr,
         create_options: CreateOptions,
-        granted_access: FileAccessRights,
+        _granted_access: FileAccessRights,
     ) -> Result<(Self::FileContext, FileInfo), NTSTATUS> {
         debug!(
-            "[WinFSP] open(file_name: {:?}, create_option: {:x?}, granted_access: {:x?})",
-            file_name, create_options, granted_access
+            "[WinFSP] open(file_name: {:?}, create_options: {:?})",
+            file_name, create_options
         );
 
-        let file_name = PathBuf::from(file_name.to_os_string());
+        let path = file_name.to_os_string().to_string_lossy().into_owned();
 
-        match self.entries.lock().unwrap().get(&file_name) {
-            Some(entry) => {
-                let file_context = entry.clone();
-                let file_info = self.get_file_info_from_obj(&file_context.lock().unwrap())?;
-                Ok((file_context, file_info))
-            }
-            None => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+        let file_handle = match self.client().open_file(&path, create_options.0 as i32) {
+            Ok(handle) => handle,
+            Err(_) => return Err(STATUS_ACCESS_DENIED),
+        };
+
+        {
+            let mut handle_map = self.handle_to_path.lock().unwrap();
+            handle_map.insert(file_handle, path.clone());
         }
+
+        let metadata = match self.client().get_file_metadata(&path) {
+            Some(meta) => meta,
+            None => return Err(STATUS_OBJECT_NAME_NOT_FOUND),
+        };
+
+        info!(
+            "Apertura completata: path={}, handle={}, è_directory={}",
+            path,
+            file_handle,
+            metadata.file_type == RemoteFsFileType::Directory
+        );
+
+        Ok((file_handle as usize, metadata.to_file_info()))
     }
 
     const OVERWRITE_EX_DEFINED: bool = true;
     fn overwrite_ex(
         &self,
         file_context: Self::FileContext,
-        mut file_attributes: FileAttributes,
+        file_attributes: FileAttributes,
         replace_file_attributes: bool,
         allocation_size: u64,
         _buffer: &[u8],
     ) -> Result<FileInfo, NTSTATUS> {
-        let mut fc = file_context.lock().unwrap();
         debug!(
-            "[WinFSP] overwrite(file_context: {:?}, file_attributes: {:?}, replace_file_attributes: {:?}, allocation_size: {:?})",
-            fc, file_attributes, replace_file_attributes, allocation_size
+            "[WinFSP] overwrite_ex(file_context: {:?}, file_attributes: {:?}, replace: {}, allocation_size: {})",
+            file_context, file_attributes, replace_file_attributes, allocation_size
         );
 
-        if self.read_only {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
-        }
+        let file_handle = file_context as u64;
 
-        if let Obj::File(file_obj) = fc.deref_mut() {
-            // File attributes
-            file_attributes |= FileAttributes::ARCHIVE;
-            if replace_file_attributes {
-                file_obj.info.set_file_attributes(file_attributes);
-            } else {
-                file_obj
-                    .info
-                    .set_file_attributes(file_attributes | file_obj.info.file_attributes());
-            }
+        let mut updates = serde_json::Map::new();
 
-            // Allocation size
-            file_obj.set_allocation_size(allocation_size as usize);
-
-            // Set times
-            let now = filetime_now();
-            file_obj.info.set_last_access_time(now);
-            file_obj.info.set_last_write_time(now);
-            file_obj.info.set_change_time(now);
+        if replace_file_attributes {
+            updates.insert("mode".to_string(), serde_json::json!(file_attributes.0));
         } else {
-            unreachable!()
+            let updated_mode = file_attributes.0 | FileAttributes::ARCHIVE.0;
+            updates.insert("mode".to_string(), serde_json::json!(updated_mode));
         }
 
-        self.get_file_info_from_obj(&fc)
+        updates.insert("size".to_string(), serde_json::json!(allocation_size));
+
+        let updates_json = serde_json::Value::Object(updates);
+
+        let path = {
+            let handle_map: std::sync::MutexGuard<'_, HashMap<u64, String>> =
+                self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => {
+                    error!("File handle {} non trovato nella mappa", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+            }
+        };
+
+        let metadata = self
+            .client()
+            .update_file_metadata(&path, updates_json)
+            .ok_or(STATUS_MEDIA_WRITE_PROTECTED)?;
+
+        Ok(metadata.to_file_info())
     }
 
-    const CLEANUP_DEFINED: bool = true;
+    const CLEANUP_DEFINED: bool = false;
     fn cleanup(
         &self,
         file_context: Self::FileContext,
         file_name: Option<&U16CStr>,
         flags: CleanupFlags,
     ) {
-        let mut fc = file_context.lock().unwrap();
         debug!(
-            "[WinFSP] cleanup(file_context: {:?}, file_name: {:?}, flags: {:x?})",
-            fc, file_name, flags
+            "[WinFSP] cleanup(file_context: {:?}, file_name: {:?}, flags: {:?})",
+            file_context, file_name, flags
         );
 
-        if self.read_only {
-            return;
-        }
+        let handle = file_context as u64;
 
-        let mut entries = self.entries.lock().unwrap();
-
-        if let Obj::File(file_obj) = fc.deref_mut() {
-            // Resize
-            if flags.is(CleanupFlags::SET_ALLOCATION_SIZE) {
-                file_obj.adapt_allocation_size(file_obj.info.file_size() as usize)
-            }
-
-            // Set archive bit
-            if flags.is(CleanupFlags::SET_ARCHIVE_BIT) {
-                file_obj
-                    .info
-                    .set_file_attributes(FileAttributes::ARCHIVE | file_obj.info.file_attributes());
-            }
-
-            let now = filetime_now();
-            // Set last access time
-            if flags.is(CleanupFlags::SET_LAST_ACCESS_TIME) {
-                file_obj.info.set_last_access_time(now);
-            }
-
-            if flags.is(CleanupFlags::SET_LAST_WRITE_TIME) {
-                file_obj.info.set_last_write_time(now);
-            }
-
-            if flags.is(CleanupFlags::SET_CHANGE_TIME) {
-                file_obj.info.set_change_time(now);
-            }
-        }
-
-        // Delete
-        if let Some(file_name) = file_name {
-            assert!(flags.is(CleanupFlags::DELETE));
-            let file_name = PathBuf::from(file_name.to_os_string());
-
-            // check for non-empty directory
-            if entries
-                .keys()
-                .any(|entry| entry.parent() == Some(&file_name))
-            {
-                return;
-            }
-
-            entries.remove(&file_name);
+        let mut handle_map = self.handle_to_path.lock().unwrap();
+        if let Some(path) = handle_map.remove(&handle) {
+            info!("Handle {} (path: {}) rimosso dalla mappa", handle, path);
         }
     }
 
@@ -583,23 +312,42 @@ impl FileSystemInterface for MemFs {
         buffer: &mut [u8],
         offset: u64,
     ) -> Result<usize, NTSTATUS> {
-        let fc = file_context.lock().unwrap();
         debug!(
-            "[WinFSP] read(file_context: {:?}, buffer_size: {}, offset: {:?})",
-            fc,
+            "[WinFSP] read(file_context: {:?}, buffer_size: {}, offset: {})",
+            file_context,
             buffer.len(),
             offset
         );
 
-        if let Obj::File(file_obj) = fc.deref() {
-            if offset >= file_obj.info.file_size() {
-                return Err(STATUS_END_OF_FILE);
+        let file_handle = file_context as u64;
+
+        let mut client = self.client.lock().unwrap();
+
+        let path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => {
+                    error!("File handle {} non trovato nella mappa", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
+                }
             }
-            let data = file_obj.read(offset as usize, buffer.len());
-            buffer[..data.len()].copy_from_slice(data);
-            Ok(data.len())
-        } else {
-            unreachable!()
+        };
+
+        match client.read_file(&path, file_handle, offset as i64, buffer.len() as u32) {
+            Ok(data) => {
+                let to_copy = data.len().min(buffer.len());
+                buffer[..to_copy].copy_from_slice(&data[..to_copy]);
+                info!("File letto: {} -> {} bytes", path, to_copy);
+                Ok(to_copy)
+            }
+            Err(error_code) => {
+                error!(
+                    "Errore durante la lettura del file {}: {}",
+                    path, error_code
+                );
+                Err(STATUS_ACCESS_DENIED)
+            }
         }
     }
 
@@ -610,50 +358,82 @@ impl FileSystemInterface for MemFs {
         buffer: &[u8],
         mode: WriteMode,
     ) -> Result<(usize, FileInfo), NTSTATUS> {
-        let mut fc = file_context.lock().unwrap();
         debug!(
-            "[WinFSP] write(file_context: {:?}, buffer: {:?}, mode: {:?})",
-            fc, buffer, mode,
+            "[WinFSP] write(file_context: {:?}, buffer.len(): {}, mode: {:?})",
+            file_context,
+            buffer.len(),
+            mode
         );
 
-        if self.read_only {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
-        }
+        let file_handle = file_context as u64;
 
-        let written = if let Obj::File(file_obj) = fc.deref_mut() {
-            match mode {
-                WriteMode::Normal { offset } => file_obj.write(buffer, offset as usize),
-                WriteMode::ConstrainedIO { offset } => {
-                    file_obj.constrained_write(buffer, offset as usize)
-                }
-                WriteMode::WriteToEOF => {
-                    let offset = file_obj.info.file_size();
-                    file_obj.write(buffer, offset as usize)
+        let mut client = self.client.lock().unwrap();
+
+        let path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => {
+                    error!("File handle {} non trovato nella mappa", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
                 }
             }
-        } else {
-            unreachable!()
         };
 
-        Ok((written, self.get_file_info_from_obj(&fc)?))
+        match client.write_file(&path, file_handle, 0, buffer) {
+            Ok(written) => {
+                info!("File scritto: {} -> {} bytes", path, written);
+
+                let metadata = client
+                    .get_file_metadata(&path)
+                    .map(|m| m.to_file_info())
+                    .unwrap_or_else(FileInfo::default);
+                Ok((written as usize, metadata))
+            }
+            Err(error_code) => {
+                error!(
+                    "Errore durante la scrittura del file {}: {}",
+                    path, error_code
+                );
+                Err(STATUS_ACCESS_DENIED)
+            }
+        }
     }
 
     const FLUSH_DEFINED: bool = true;
-    fn flush(&self, file_context: Self::FileContext) -> Result<FileInfo, NTSTATUS> {
-        let fc = file_context.lock().unwrap();
-        debug!("[WinFSP] flush(file_context: {:?})", fc);
 
-        self.get_file_info_from_obj(&fc)
+    fn flush(&self, file_context: Self::FileContext) -> Result<FileInfo, i32> {
+        debug!("[WinFSP] flush(file_context: {:?})", file_context);
+
+        info!("Flush completato per handle {}", file_context);
+        Ok(FileInfo::default())
     }
 
     const GET_FILE_INFO_DEFINED: bool = true;
     fn get_file_info(&self, file_context: Self::FileContext) -> Result<FileInfo, NTSTATUS> {
-        let fc = file_context.lock().unwrap();
-        debug!("[WinFSP] get_file_info(file_context: {:?})", fc);
+        debug!("[WinFSP] get_file_info(file_context: {:?})", file_context);
 
-        match &*fc {
-            Obj::File(file_obj) => Ok(file_obj.info),
-            Obj::Folder(folder_obj) => Ok(folder_obj.info),
+        let file_handle = file_context as u64;
+
+        let mut client = self.client.lock().unwrap();
+
+        let path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => {
+                    error!("File handle {} non trovato nella mappa", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+            }
+        };
+
+        match client.get_file_metadata(&path) {
+            Some(meta) => Ok(meta.to_file_info()),
+            None => {
+                error!("Metadati non trovati per file {}", path);
+                Err(STATUS_OBJECT_NAME_NOT_FOUND)
+            }
         }
     }
 
@@ -667,54 +447,45 @@ impl FileSystemInterface for MemFs {
         last_write_time: u64,
         change_time: u64,
     ) -> Result<FileInfo, NTSTATUS> {
-        let mut fc = file_context.lock().unwrap();
         debug!(
             "[WinFSP] set_basic_info(file_context: {:?}, file_attributes: {:?}, creation_time: {:?}, last_access_time: {:?}, last_write_time: {:?}, change_time: {:?})",
-            fc, file_attributes, creation_time, last_access_time, last_write_time, change_time
+            file_context,
+            file_attributes,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time
         );
 
-        if self.read_only {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
-        }
+        let file_handle = file_context as u64;
 
-        match fc.deref_mut() {
-            Obj::File(file_obj) => {
-                if !file_attributes.is(FileAttributes::INVALID) {
-                    file_obj.info.set_file_attributes(file_attributes);
-                }
-                if creation_time != 0 {
-                    file_obj.info.set_creation_time(creation_time);
-                }
-                if last_access_time != 0 {
-                    file_obj.info.set_last_access_time(last_access_time);
-                }
-                if last_write_time != 0 {
-                    file_obj.info.set_last_write_time(last_write_time);
-                }
-                if change_time != 0 {
-                    file_obj.info.set_change_time(change_time);
+        let client = self.client.lock().unwrap();
+
+        let path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => {
+                    error!("File handle {} non trovato nella mappa", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
                 }
             }
-            Obj::Folder(folder_obj) => {
-                if !file_attributes.is(FileAttributes::INVALID) {
-                    folder_obj.info.set_file_attributes(file_attributes);
-                }
-                if creation_time != 0 {
-                    folder_obj.info.set_creation_time(creation_time);
-                }
-                if last_access_time != 0 {
-                    folder_obj.info.set_last_access_time(last_access_time);
-                }
-                if last_write_time != 0 {
-                    folder_obj.info.set_last_write_time(last_write_time);
-                }
-                if change_time != 0 {
-                    folder_obj.info.set_change_time(change_time);
-                }
+        };
+
+        let mut updates = serde_json::Map::new();
+        updates.insert("mode".to_string(), serde_json::json!(file_attributes.0));
+        updates.insert("crtime".to_string(), serde_json::json!(creation_time));
+        updates.insert("atime".to_string(), serde_json::json!(last_access_time));
+        updates.insert("mtime".to_string(), serde_json::json!(last_write_time));
+        updates.insert("ctime".to_string(), serde_json::json!(change_time));
+
+        match client.update_file_metadata(&path, serde_json::Value::Object(updates)) {
+            Some(meta) => Ok(meta.to_file_info()),
+            None => {
+                error!("Impossibile aggiornare gli attributi per {}", path);
+                Err(STATUS_ACCESS_DENIED)
             }
         }
-
-        self.get_file_info_from_obj(&fc)
     }
 
     const SET_FILE_SIZE_DEFINED: bool = true;
@@ -722,32 +493,39 @@ impl FileSystemInterface for MemFs {
         &self,
         file_context: Self::FileContext,
         new_size: u64,
-        set_allocation_size: bool,
+        allocation_size: bool,
     ) -> Result<FileInfo, NTSTATUS> {
-        let mut fc = file_context.lock().unwrap();
         debug!(
-            "[WinFSP] set_file_size(file_context: {:?}, new_size: {}, set_allocation_size: {})",
-            fc, new_size, set_allocation_size
+            "[WinFSP] set_file_size(file_context: {:?}, new_size: {}, allocation_size: {})",
+            file_context, new_size, allocation_size
         );
 
-        if self.read_only {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
-        }
-
-        match fc.deref_mut() {
-            Obj::File(file_obj) => {
-                if set_allocation_size {
-                    file_obj.set_allocation_size(new_size as usize)
-                } else {
-                    file_obj.set_file_size(new_size as usize)
+        let file_handle = file_context as u64;
+        let path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => {
+                    error!("File handle {} non trovato nella mappa", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
                 }
             }
-            Obj::Folder(_) => {
-                unreachable!()
+        };
+
+        let updates = serde_json::json!({
+            "size": new_size
+        });
+
+        match self.client().update_file_metadata(&path, updates) {
+            Some(metadata) => {
+                info!("Dimensione file aggiornata: {} -> {} bytes", path, new_size);
+                Ok(metadata.to_file_info())
+            }
+            None => {
+                error!("Impossibile aggiornare dimensione per {}", path);
+                Err(STATUS_MEDIA_WRITE_PROTECTED)
             }
         }
-
-        self.get_file_info_from_obj(&fc)
     }
 
     const RENAME_DEFINED: bool = true;
@@ -758,49 +536,51 @@ impl FileSystemInterface for MemFs {
         new_file_name: &U16CStr,
         replace_if_exists: bool,
     ) -> Result<(), NTSTATUS> {
-        {
-            let fc = file_context.lock().unwrap();
-            debug!("[WinFSP] rename(file_context: {:?}, file_name: {:?}, new_file_name: {:?}, replace_if_exists: {:?})", fc, file_name, new_file_name, replace_if_exists);
-        }
+        debug!(
+            "[WinFSP] rename(file_context: {:?}, file_name: {:?}, new_file_name: {:?}, replace_if_exists: {:?})",
+            file_context, file_name, new_file_name, replace_if_exists
+        );
 
-        if self.read_only {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
-        }
+        let file_handle = file_context as u64;
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut client = self.client.lock().unwrap();
 
-        let file_name = PathBuf::from(file_name.to_os_string());
-        let new_file_name = PathBuf::from(new_file_name.to_os_string());
-        let file_name_str = file_name.to_str().unwrap();
-        let new_file_name_str = new_file_name.to_str().unwrap();
+        let old_path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => {
+                    error!("File handle {} non trovato nella mappa", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
+                }
+            }
+        };
 
-        if entries.contains_key(&new_file_name) {
-            if let Obj::Folder(_) = entries.get(&file_name).unwrap().lock().unwrap().deref() {
+        let new_path = new_file_name.to_os_string().to_string_lossy().into_owned();
+
+        if !replace_if_exists {
+            if client.get_file_metadata(&new_path).is_some() {
+                error!(
+                    "File destinazione esistente e replace_if_exists=false: {}",
+                    new_path
+                );
                 return Err(STATUS_ACCESS_DENIED);
             }
-            if replace_if_exists {
-                entries.remove(&new_file_name);
-            } else {
-                return Err(STATUS_OBJECT_NAME_COLLISION);
+        }
+
+        match client.rename_filesystem_object(&old_path, &new_path) {
+            Ok(()) => {
+                info!("Rinomina riuscita: {} -> {}", old_path, new_path);
+                Ok(())
+            }
+            Err(code) => {
+                error!(
+                    "Errore backend durante rinomina: {} -> {} code: {}",
+                    old_path, new_path, code
+                );
+                Err(code as NTSTATUS)
             }
         }
-
-        let iter_entries = entries
-            .keys()
-            .map(|path| path.to_str().unwrap().to_string())
-            .filter(|path| path.starts_with(file_name_str))
-            .collect::<Vec<String>>();
-
-        for entry_path in iter_entries {
-            let new_entry_path =
-                PathBuf::from(entry_path.replacen(file_name_str, new_file_name_str, 1));
-
-            let entry = entries.remove(Path::new(&entry_path)).unwrap();
-            entry.lock().unwrap().set_path(new_entry_path.clone());
-            entries.insert(new_entry_path, entry);
-        }
-
-        Ok(())
     }
 
     const GET_SECURITY_DEFINED: bool = true;
@@ -808,43 +588,19 @@ impl FileSystemInterface for MemFs {
         &self,
         file_context: Self::FileContext,
     ) -> Result<PSecurityDescriptor, NTSTATUS> {
-        let fc = file_context.lock().unwrap();
-        debug!("[WinFSP] get_security(file_context: {:?})", fc);
+        debug!("[WinFSP] get_security(file_context: {:?})", file_context);
 
-        match &*fc {
-            Obj::File(file_obj) => Ok(file_obj.security_descriptor.as_ptr()),
-            Obj::Folder(folder_obj) => Ok(folder_obj.security_descriptor.as_ptr()),
-        }
+        Ok(PSecurityDescriptor::default())
     }
 
     const SET_SECURITY_DEFINED: bool = true;
     fn set_security(
         &self,
         file_context: Self::FileContext,
-        security_information: u32,
-        modification_descriptor: PSecurityDescriptor,
+        _security_information: u32,
+        _modification_descriptor: PSecurityDescriptor,
     ) -> Result<(), NTSTATUS> {
-        let mut fc = file_context.lock().unwrap();
-        debug!("[WinFSP] set_security(file_context: {:?}, security_information: {:?}, modification_descriptor: {:?})", fc, security_information, modification_descriptor);
-
-        if self.read_only {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
-        }
-
-        match fc.deref_mut() {
-            Obj::File(file_obj) => {
-                let new_descriptor = file_obj
-                    .security_descriptor
-                    .set(security_information, modification_descriptor)?;
-                file_obj.security_descriptor = new_descriptor;
-            }
-            Obj::Folder(folder_obj) => {
-                let new_descriptor = folder_obj
-                    .security_descriptor
-                    .set(security_information, modification_descriptor)?;
-                folder_obj.security_descriptor = new_descriptor;
-            }
-        }
+        debug!("[WinFSP] set_security(file_context: {:?})", file_context);
 
         Ok(())
     }
@@ -856,63 +612,91 @@ impl FileSystemInterface for MemFs {
         marker: Option<&U16CStr>,
         mut add_dir_info: impl FnMut(DirInfo) -> bool,
     ) -> Result<(), NTSTATUS> {
-        let fc = file_context.lock().unwrap();
         debug!(
             "[WinFSP] read_directory(file_context: {:?}, marker: {:?})",
-            fc, marker
+            file_context, marker
         );
 
-        let entries = self.entries.lock().unwrap();
+        let file_handle = file_context as u64;
+        let mut client = self.client.lock().unwrap();
 
-        match &*fc {
-            Obj::File(_) => Err(STATUS_NOT_A_DIRECTORY),
-            Obj::Folder(folder_obj) => {
-                let mut res_entries = vec![];
-
-                if folder_obj.path != self.root_path && marker.is_none() {
-                    let parent_path = folder_obj.path.parent().unwrap();
-                    res_entries.push((u16cstr!(".").to_owned(), folder_obj.info));
-                    let parent_obj = entries[parent_path].lock().unwrap();
-                    res_entries.push((u16cstr!("..").into(), FileInfo::from(parent_obj.deref())));
+        let path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => {
+                    error!("File handle {} non trovato nella mappa", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
                 }
+            }
+        };
 
-                for (entry_path, entry_obj) in entries.iter().filter(|(entry_path, _)| {
-                    // - Filter out unrelated entries
-                    // - Filter out ourself or our grandchildren
-                    let entry_path_len = entry_path.components().count();
-                    let folder_obj_path_len = folder_obj.path.components().count();
-
-                    entry_path.starts_with(&folder_obj.path)
-                        && entry_path_len == folder_obj_path_len + 1
-                }) {
-                    let entry_obj = entry_obj.lock().unwrap();
-                    res_entries.push((
-                        U16CString::from_os_str(entry_path.file_name().unwrap()).unwrap(),
-                        FileInfo::from(entry_obj.deref()),
-                    ));
-                }
-
-                res_entries.sort_by(|x, y| y.0.cmp(&x.0));
-
-                if let Some(marker) = marker {
-                    // # Filter out all results before the marker
-                    if let Some(i) = res_entries.iter().position(|x| x.0 == marker) {
-                        res_entries.truncate(i);
-                    }
-                }
-
-                res_entries.reverse();
-
-                for (file_name, file_info) in res_entries {
-                    let dir_info = DirInfo::new(file_info, &file_name);
-                    if !add_dir_info(dir_info) {
-                        break;
-                    }
-                }
-
-                Ok(())
+        match client.get_file_metadata(&path) {
+            Some(metadata) if metadata.file_type == crate::types::RemoteFsFileType::Directory => {}
+            Some(_) => {
+                error!("Path {} non è una directory", path);
+                return Err(STATUS_NOT_A_DIRECTORY);
+            }
+            None => {
+                error!("Directory {} non trovata", path);
+                return Err(STATUS_OBJECT_NAME_NOT_FOUND);
             }
         }
+
+        let entries = match client.list_directory(&path) {
+            Ok(entries) => entries,
+            Err(_) => return Err(STATUS_ACCESS_DENIED),
+        };
+        let entries_len = entries.len();
+
+        let marker_str = marker.map(|m| m.to_string_lossy().to_string());
+        let mut should_continue = true;
+
+        if should_continue && (marker_str.is_none() || marker_str.as_ref().unwrap().as_str() <= ".")
+        {
+            let dir_info = DirInfo::from_str(FileInfo::default(), ".");
+            should_continue = add_dir_info(dir_info);
+        }
+
+        if should_continue
+            && (marker_str.is_none() || marker_str.as_ref().unwrap().as_str() <= "..")
+        {
+            let dir_info = DirInfo::from_str(FileInfo::default(), "..");
+            should_continue = add_dir_info(dir_info);
+        }
+
+        for (name, _ino, _file_type) in entries {
+            if !should_continue {
+                break;
+            }
+
+            if let Some(ref marker_name) = marker_str {
+                if name <= *marker_name {
+                    continue;
+                }
+            }
+
+            let full_path = if path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", path, name)
+            };
+
+            let metadata = match client.get_file_metadata(&full_path) {
+                Some(meta) => meta,
+                None => continue,
+            };
+
+            let dir_info = DirInfo::from_str(metadata.to_file_info(), &name);
+            should_continue = add_dir_info(dir_info);
+        }
+
+        info!(
+            "Read directory completato per {}: {} entries processate",
+            path,
+            entries_len + 2
+        );
+        Ok(())
     }
 
     const SET_DELETE_DEFINED: bool = true;
@@ -922,26 +706,261 @@ impl FileSystemInterface for MemFs {
         file_name: &U16CStr,
         delete_file: bool,
     ) -> Result<(), NTSTATUS> {
-        let fc = file_context.lock().unwrap();
         debug!(
-            "[WinFSP] set_delete(file_context: {:?}, file_name: {:?}, delete_file: {:?})",
-            fc, file_name, delete_file
+            "[WinFSP] set_delete(file_context: {:?}, file_name: {:?}, delete: {})",
+            file_context, file_name, delete_file
         );
 
-        if self.read_only {
-            return Err(STATUS_MEDIA_WRITE_PROTECTED);
+        if !delete_file {
+            return Ok(());
         }
 
-        let entries = self.entries.lock().unwrap();
-        let file_name = PathBuf::from(file_name.to_os_string());
+        let file_name_str = file_name.to_string_lossy();
 
-        if entries
-            .keys()
-            .any(|entry| entry.parent() == Some(&file_name))
-        {
-            return Err(STATUS_DIRECTORY_NOT_EMPTY);
+        if file_name_str == "." || file_name_str == ".." {
+            return Ok(());
         }
 
-        Ok(())
+        let file_handle = file_context as u64;
+        let mut client = self.client.lock().unwrap();
+        let path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => return Err(STATUS_INVALID_HANDLE),
+            }
+        };
+
+        let is_directory = match client.get_file_metadata(&path) {
+            Some(meta) => meta.file_type == RemoteFsFileType::Directory,
+            None => return Err(STATUS_OBJECT_NAME_NOT_FOUND),
+        };
+
+        match client.remove_filesystem_object(&path, is_directory) {
+            Ok(()) => {
+                info!("File/Directory rimosso: {}", path);
+                Ok(())
+            }
+            Err(error_code) => {
+                error!("Errore rimozione {}: {}", path, error_code);
+                Err(error_code as NTSTATUS)
+            }
+        }
     }
+
+    const GET_VOLUME_INFO_DEFINED: bool = false;
+
+    const SET_VOLUME_LABEL_DEFINED: bool = false;
+
+    const CREATE_DEFINED: bool = false;
+
+    const OVERWRITE_DEFINED: bool = false;
+
+    const CLOSE_DEFINED: bool = true;
+    fn close(&self, _file_context: Self::FileContext) -> () {}
+
+    const CAN_DELETE_DEFINED: bool = true;
+    fn can_delete(
+        &self,
+        file_context: Self::FileContext,
+        file_name: &U16CStr,
+    ) -> Result<(), NTSTATUS> {
+        debug!(
+            "[WinFSP] can_delete(file_context: {:?}, file_name: {:?})",
+            file_context, file_name
+        );
+
+        let file_handle = file_context as u64;
+        let mut client = self.client.lock().unwrap();
+        let path = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            match handle_map.get(&file_handle) {
+                Some(p) => p.clone(),
+                None => return Err(STATUS_INVALID_HANDLE),
+            }
+        };
+
+        match client.get_file_metadata(&path) {
+            Some(meta) => {
+                if meta.file_type == RemoteFsFileType::Directory {
+                    match client.list_directory(&path) {
+                        Ok(entries) => {
+                            let has_real_files =
+                                entries.iter().any(|(name, ..)| name != "." && name != "..");
+
+                            if has_real_files {
+                                Err(STATUS_DIRECTORY_NOT_EMPTY)
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        Err(_) => Err(STATUS_ACCESS_DENIED),
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            None => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+        }
+    }
+
+    const GET_REPARSE_POINT_DEFINED: bool = false;
+
+    const SET_REPARSE_POINT_DEFINED: bool = false;
+
+    const DELETE_REPARSE_POINT_DEFINED: bool = false;
+
+    const GET_STREAM_INFO_DEFINED: bool = false;
+
+    const GET_DIR_INFO_BY_NAME_DEFINED: bool = false;
+
+    const CONTROL_DEFINED: bool = false;
+
+    const GET_EA_DEFINED: bool = false;
+
+    const SET_EA_DEFINED: bool = false;
+
+    const DISPATCHER_STOPPED_DEFINED: bool = false;
+
+    const RESOLVE_REPARSE_POINTS_DEFINED: bool = false;
+
+    const GET_SECURITY_BY_NAME_DEFINED: bool = true;
+
+    fn get_security_by_name(
+        &self,
+        file_name: &U16CStr,
+        _find_reparse_point: impl Fn() -> Option<FileAttributes>,
+    ) -> Result<(FileAttributes, PSecurityDescriptor, bool), NTSTATUS> {
+        debug!("[WinFSP] get_security_by_name(file_name: {:?})", file_name);
+
+        let path = file_name.to_os_string().to_string_lossy().into_owned();
+
+        if path == "." || path == ".." {
+            return Ok((
+                FileAttributes::DIRECTORY,
+                PSecurityDescriptor::default(),
+                false,
+            ));
+        }
+
+        let mut client = self.client.lock().unwrap();
+        match client.get_file_metadata(&path) {
+            Some(metadata) => Ok((
+                FileAttributes(metadata.permissions as u32),
+                PSecurityDescriptor::default(),
+                false,
+            )),
+            None => {
+                debug!("File {} non esiste per get_security_by_name", path);
+                Err(STATUS_OBJECT_NAME_NOT_FOUND)
+            }
+        }
+    }
+
+    fn get_volume_info(&self) -> Result<VolumeInfo, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn set_volume_label(&self, _volume_label: &U16CStr) -> Result<VolumeInfo, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn create(
+        &self,
+        _file_name: &U16CStr,
+        _create_file_info: CreateFileInfo,
+        _security_descriptor: SecurityDescriptor,
+    ) -> Result<(Self::FileContext, FileInfo), NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn overwrite(
+        &self,
+        _file_context: Self::FileContext,
+        _file_attributes: FileAttributes,
+        _replace_file_attributes: bool,
+        _allocation_size: u64,
+    ) -> Result<FileInfo, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn get_reparse_point(
+        &self,
+        _file_context: Self::FileContext,
+        _file_name: &U16CStr,
+        _buffer: &mut [u8],
+    ) -> Result<usize, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn set_reparse_point(
+        &self,
+        _file_context: Self::FileContext,
+        _file_name: &U16CStr,
+        _buffer: &mut [u8],
+    ) -> Result<(), NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn delete_reparse_point(
+        &self,
+        _file_context: Self::FileContext,
+        _file_name: &U16CStr,
+        _buffer: &mut [u8],
+    ) -> Result<(), NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn get_stream_info(
+        &self,
+        _file_context: Self::FileContext,
+        _buffer: &mut [u8],
+    ) -> Result<usize, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn get_dir_info_by_name(
+        &self,
+        _file_context: Self::FileContext,
+        _file_name: &U16CStr,
+    ) -> Result<FileInfo, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn control(
+        &self,
+        _file_context: Self::FileContext,
+        _control_code: u32,
+        _input_buffer: &[u8],
+        _output_buffer: &mut [u8],
+    ) -> Result<usize, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn get_ea(&self, _file_context: Self::FileContext, _buffer: &[u8]) -> Result<usize, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn set_ea(
+        &self,
+        _file_context: Self::FileContext,
+        _buffer: &[u8],
+    ) -> Result<FileInfo, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn dispatcher_stopped(&self, _normally: bool) {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    fn get_reparse_point_by_name(
+        &self,
+        _file_name: &U16CStr,
+        _is_directory: bool,
+        _buffer: Option<&mut [u8]>,
+    ) -> Result<usize, NTSTATUS> {
+        std::unreachable!("To be used, trait method must be overwritten !");
+    }
+
+    type FileContext = usize;
 }
