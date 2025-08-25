@@ -74,8 +74,16 @@ impl FileMetadata {
         info.set_file_attributes(attributes);
 
         fn to_filetime(secs: u64) -> u64 {
+            // Se il valore è già un FILETIME (> 10^16), restituiscilo così com'è
+            if secs > 1_000_000_000_000_000_000 {
+                return secs;
+            }
+            
+            // Altrimenti converti da Unix timestamp a FILETIME
             // FILETIME = (UnixTime + 11644473600) * 10^7
-            (secs + 11644473600) * 10_000_000
+            // Controllo overflow prima della moltiplicazione
+            let base_time = secs.saturating_add(11644473600);
+            base_time.saturating_mul(10_000_000)
         }
         info.set_creation_time(to_filetime(self.crtime.unwrap_or(self.ctime)));
         info.set_last_access_time(to_filetime(self.atime));

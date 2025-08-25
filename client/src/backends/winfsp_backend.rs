@@ -1,6 +1,6 @@
 #[cfg(target_os = "windows")]
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -25,6 +25,7 @@ macro_rules! debug {
 pub struct WinFspRemoteFs {
     client: Mutex<RemoteFsClient>,
     handle_to_path: Arc<Mutex<HashMap<u64, String>>>,
+    files_marked_for_deletion: Arc<Mutex<HashSet<u64>>>,
     drive_letter: String,
 }
 
@@ -32,7 +33,7 @@ pub struct WinFspRemoteFs {
 impl WinFspRemoteFs {
     pub fn new(api_url: String, drive_letter: String) -> Self {
         use std::{
-            collections::HashMap,
+            collections::{HashMap, HashSet},
             sync::{Arc, Mutex},
         };
 
@@ -46,6 +47,7 @@ impl WinFspRemoteFs {
         Self {
             client: Mutex::new(client),
             handle_to_path: Arc::new(Mutex::new(HashMap::new())),
+            files_marked_for_deletion: Arc::new(Mutex::new(HashSet::new())),
             drive_letter,
         }
     }
@@ -174,6 +176,31 @@ impl FileSystemInterface for WinFspRemoteFs {
                     };
                     (metadata, file_handle)
                 }
+                Err(17) => {
+                    // File già esistente - proviamo ad aprirlo invece di crearlo
+                    debug!("File {} già esistente, tentativo di apertura", path);
+                    
+                    if let Some(existing_metadata) = client.get_file_metadata(&path) {
+                        let file_handle = if !is_directory {
+                            match client.open_file(&path, create_file_info.create_options.0 as i32) {
+                                Ok(h) => {
+                                    info!("File esistente aperto: {} -> handle {}", path, h);
+                                    h
+                                }
+                                Err(_) => {
+                                    error!("Impossibile aprire file esistente: {}", path);
+                                    return Err(STATUS_ACCESS_DENIED);
+                                }
+                            }
+                        } else {
+                            0
+                        };
+                        (existing_metadata, file_handle)
+                    } else {
+                        error!("File {} risulta esistente ma non trovato", path);
+                        return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+                    }
+                }
                 Err(e) => {
                     error!("Errore creazione {}: {}", path, e);
                     return Err(e as NTSTATUS);
@@ -216,9 +243,11 @@ impl FileSystemInterface for WinFspRemoteFs {
             Err(_) => return Err(STATUS_ACCESS_DENIED),
         };
 
+        // Sempre registra l'handle nella mappa, anche se è duplicato
         {
             let mut handle_map = self.handle_to_path.lock().unwrap();
             handle_map.insert(file_handle, path.clone());
+            debug!("Handle {} registrato per path {}", file_handle, path);
         }
 
         let metadata = match self.client().get_file_metadata(&path) {
@@ -271,7 +300,9 @@ impl FileSystemInterface for WinFspRemoteFs {
             match handle_map.get(&file_handle) {
                 Some(p) => p.clone(),
                 None => {
-                    error!("File handle {} non trovato nella mappa", file_handle);
+                    // Se l'handle non è nella mappa, restituiamo un errore per ora
+                    // TODO: implementare un fallback più sofisticato
+                    error!("File handle {} non trovato nella mappa in overwrite_ex, tentando di continuare con path vuoto", file_handle);
                     return Err(STATUS_INVALID_HANDLE);
                 }
             }
@@ -285,7 +316,7 @@ impl FileSystemInterface for WinFspRemoteFs {
         Ok(metadata.to_file_info())
     }
 
-    const CLEANUP_DEFINED: bool = false;
+    const CLEANUP_DEFINED: bool = true;
     fn cleanup(
         &self,
         file_context: Self::FileContext,
@@ -299,10 +330,46 @@ impl FileSystemInterface for WinFspRemoteFs {
 
         let handle = file_context as u64;
 
-        let mut handle_map = self.handle_to_path.lock().unwrap();
-        if let Some(path) = handle_map.remove(&handle) {
-            info!("Handle {} (path: {}) rimosso dalla mappa", handle, path);
+        // Controlla se questo file è stato marcato per eliminazione
+        let mut marked_files = self.files_marked_for_deletion.lock().unwrap();
+        let should_delete = marked_files.contains(&handle);
+        
+        if should_delete {
+            // Rimuovi dalla lista dei file marcati
+            marked_files.remove(&handle);
+            drop(marked_files); // Rilascia il lock prima delle operazioni
+            
+            let handle_map = self.handle_to_path.lock().unwrap();
+            if let Some(path) = handle_map.get(&handle) {
+                let path_clone = path.clone();
+                drop(handle_map); // Rilascia il lock prima della chiamata al client
+
+                let mut client = self.client.lock().unwrap();
+                let is_directory = match client.get_file_metadata(&path_clone) {
+                    Some(meta) => meta.file_type == RemoteFsFileType::Directory,
+                    None => false,
+                };
+
+                info!("Tentativo eliminazione file in cleanup: {} (handle: {})", path_clone, handle);
+                match client.remove_filesystem_object(&path_clone, is_directory) {
+                    Ok(()) => {
+                        info!("File/Directory eliminato in cleanup: {}", path_clone);
+                        
+                        // Rimuovi l'handle dalla mappa solo dopo eliminazione riuscita
+                        let mut handle_map = self.handle_to_path.lock().unwrap();
+                        handle_map.remove(&handle);
+                    }
+                    Err(error_code) => {
+                        error!("Errore eliminazione in cleanup {}: {} (code: {})", path_clone, error_code, error_code);
+                    }
+                }
+            }
+        } else {
+            drop(marked_files); // Rilascia il lock se non serve eliminare
         }
+
+        
+        debug!("Cleanup completato per handle {} (file eliminato: {})", handle, should_delete);
     }
 
     const READ_DEFINED: bool = true;
@@ -326,9 +393,13 @@ impl FileSystemInterface for WinFspRemoteFs {
         let path = {
             let handle_map = self.handle_to_path.lock().unwrap();
             match handle_map.get(&file_handle) {
-                Some(p) => p.clone(),
+                Some(p) => {
+                    debug!("Handle {} trovato per lettura: {}", file_handle, p);
+                    p.clone()
+                }
                 None => {
-                    error!("File handle {} non trovato nella mappa", file_handle);
+                    error!("File handle {} non trovato nella mappa per lettura", file_handle);
+                    debug!("Handle attualmente registrati: {:?}", handle_map.keys().collect::<Vec<_>>());
                     return Err(STATUS_INVALID_HANDLE);
                 }
             }
@@ -365,6 +436,17 @@ impl FileSystemInterface for WinFspRemoteFs {
             mode
         );
 
+        // Debug aggiuntivo per il contenuto del buffer
+        let preview = if buffer.len() > 20 {
+            format!("{}...{}", 
+                String::from_utf8_lossy(&buffer[..10]),
+                String::from_utf8_lossy(&buffer[buffer.len()-10..])
+            )
+        } else {
+            String::from_utf8_lossy(buffer).to_string()
+        };
+        debug!("Buffer preview: {}", preview);
+
         let file_handle = file_context as u64;
 
         let mut client = self.client.lock().unwrap();
@@ -380,7 +462,34 @@ impl FileSystemInterface for WinFspRemoteFs {
             }
         };
 
-        match client.write_file(&path, file_handle, 0, buffer) {
+       let offset = match mode {
+        WriteMode::Normal { offset } => {
+            debug!("WriteMode::Normal con offset: {}", offset);
+            offset as i64
+        },
+        WriteMode::ConstrainedIO { offset } => {
+            debug!("WriteMode::ConstrainedIO con offset: {}", offset);
+            offset as i64
+        },
+        WriteMode::WriteToEOF => {
+            // Per append, dobbiamo ottenere la dimensione attuale del file
+            let eof_offset = match client.get_file_metadata(&path) {
+                Some(meta) => {
+                    debug!("WriteMode::WriteToEOF - dimensione file attuale: {}", meta.size);
+                    meta.size as i64
+                },
+                None => {
+                    debug!("WriteMode::WriteToEOF - file non trovato, offset = 0");
+                    0
+                }
+            };
+            eof_offset
+        }
+    };
+    
+    debug!("Offset finale calcolato: {}, buffer size: {}", offset, buffer.len());
+
+        match client.write_file(&path, file_handle, offset, buffer) {
             Ok(written) => {
                 info!("File scritto: {} -> {} bytes", path, written);
 
@@ -422,8 +531,9 @@ impl FileSystemInterface for WinFspRemoteFs {
             match handle_map.get(&file_handle) {
                 Some(p) => p.clone(),
                 None => {
-                    error!("File handle {} non trovato nella mappa", file_handle);
-                    return Err(STATUS_INVALID_HANDLE);
+                    // Se l'handle non è nella mappa, potrebbe essere la root directory o un handle speciale
+                    debug!("File handle {} non trovato nella mappa, assumo root directory", file_handle);
+                    "/".to_string() // Assumiamo che sia la root directory
                 }
             }
         };
@@ -459,7 +569,13 @@ impl FileSystemInterface for WinFspRemoteFs {
 
         let file_handle = file_context as u64;
 
-        let client = self.client.lock().unwrap();
+        // Handle speciale per directory (file_handle == 0)
+        if file_handle == 0 {
+            debug!("set_basic_info chiamato su directory (handle 0), ignorando");
+            return Ok(FileInfo::default());
+        }
+
+        let mut client = self.client.lock().unwrap();
 
         let path = {
             let handle_map = self.handle_to_path.lock().unwrap();
@@ -473,11 +589,32 @@ impl FileSystemInterface for WinFspRemoteFs {
         };
 
         let mut updates = serde_json::Map::new();
-        updates.insert("mode".to_string(), serde_json::json!(file_attributes.0));
-        updates.insert("crtime".to_string(), serde_json::json!(creation_time));
-        updates.insert("atime".to_string(), serde_json::json!(last_access_time));
-        updates.insert("mtime".to_string(), serde_json::json!(last_write_time));
-        updates.insert("ctime".to_string(), serde_json::json!(change_time));
+        
+        // Solo aggiorna gli attributi che sono stati effettivamente cambiati
+        // 0xFFFFFFFF significa "non cambiare questo valore"
+        if file_attributes.0 != 0xFFFFFFFF {
+            updates.insert("mode".to_string(), serde_json::json!(file_attributes.0));
+        }
+        if creation_time != 0 {
+            updates.insert("crtime".to_string(), serde_json::json!(creation_time));
+        }
+        if last_access_time != 0 {
+            updates.insert("atime".to_string(), serde_json::json!(last_access_time));
+        }
+        if last_write_time != 0 {
+            updates.insert("mtime".to_string(), serde_json::json!(last_write_time));
+        }
+        if change_time != 0 {
+            updates.insert("ctime".to_string(), serde_json::json!(change_time));
+        }
+
+        // Se non ci sono aggiornamenti da fare, ritorna semplicemente le info attuali
+        if updates.is_empty() {
+            match client.get_file_metadata(&path) {
+                Some(meta) => return Ok(meta.to_file_info()),
+                None => return Err(STATUS_OBJECT_NAME_NOT_FOUND),
+            }
+        }
 
         match client.update_file_metadata(&path, serde_json::Value::Object(updates)) {
             Some(meta) => Ok(meta.to_file_info()),
@@ -590,7 +727,12 @@ impl FileSystemInterface for WinFspRemoteFs {
     ) -> Result<PSecurityDescriptor, NTSTATUS> {
         debug!("[WinFSP] get_security(file_context: {:?})", file_context);
 
-        Ok(PSecurityDescriptor::default())
+        // Crea un security descriptor valido con permessi base
+        let security_descriptor = SecurityDescriptor::from_wstr(u16cstr!(
+            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
+        )).map_err(|_| STATUS_ACCESS_DENIED)?;
+        
+        Ok(security_descriptor.as_ptr())
     }
 
     const SET_SECURITY_DEFINED: bool = true;
@@ -711,48 +853,32 @@ impl FileSystemInterface for WinFspRemoteFs {
             file_context, file_name, delete_file
         );
 
-        if !delete_file {
-            return Ok(());
-        }
-
         let file_name_str = file_name.to_string_lossy();
 
         if file_name_str == "." || file_name_str == ".." {
             return Ok(());
         }
 
-        let file_handle = file_context as u64;
-        let mut client = self.client.lock().unwrap();
-        let path = {
-            let handle_map = self.handle_to_path.lock().unwrap();
-            match handle_map.get(&file_handle) {
-                Some(p) => p.clone(),
-                None => return Err(STATUS_INVALID_HANDLE),
-            }
-        };
-
-        let is_directory = match client.get_file_metadata(&path) {
-            Some(meta) => meta.file_type == RemoteFsFileType::Directory,
-            None => return Err(STATUS_OBJECT_NAME_NOT_FOUND),
-        };
-
-        match client.remove_filesystem_object(&path, is_directory) {
-            Ok(()) => {
-                info!("File/Directory rimosso: {}", path);
-                Ok(())
-            }
-            Err(error_code) => {
-                error!("Errore rimozione {}: {}", path, error_code);
-                Err(error_code as NTSTATUS)
-            }
+        let handle = file_context as u64;
+        
+        // Marca o rimuovi la marcatura del file per eliminazione
+        let mut marked_files = self.files_marked_for_deletion.lock().unwrap();
+        if delete_file {
+            marked_files.insert(handle);
+            info!("File marcato per eliminazione: {} (handle: {})", file_name_str, handle);
+        } else {
+            marked_files.remove(&handle);
+            info!("Marcatura eliminazione rimossa per: {} (handle: {})", file_name_str, handle);
         }
+
+        Ok(())
     }
 
     const GET_VOLUME_INFO_DEFINED: bool = false;
 
     const SET_VOLUME_LABEL_DEFINED: bool = false;
 
-    const CREATE_DEFINED: bool = false;
+    const CREATE_DEFINED: bool = true;
 
     const OVERWRITE_DEFINED: bool = false;
 
@@ -836,20 +962,30 @@ impl FileSystemInterface for WinFspRemoteFs {
         let path = file_name.to_os_string().to_string_lossy().into_owned();
 
         if path == "." || path == ".." {
+            let security_descriptor = SecurityDescriptor::from_wstr(u16cstr!(
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
+            )).map_err(|_| STATUS_ACCESS_DENIED)?;
+            
             return Ok((
                 FileAttributes::DIRECTORY,
-                PSecurityDescriptor::default(),
+                security_descriptor.as_ptr(),
                 false,
             ));
         }
 
         let mut client = self.client.lock().unwrap();
         match client.get_file_metadata(&path) {
-            Some(metadata) => Ok((
-                FileAttributes(metadata.permissions as u32),
-                PSecurityDescriptor::default(),
-                false,
-            )),
+            Some(metadata) => {
+                let security_descriptor = SecurityDescriptor::from_wstr(u16cstr!(
+                    "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)"
+                )).map_err(|_| STATUS_ACCESS_DENIED)?;
+                
+                Ok((
+                    FileAttributes(metadata.permissions as u32),
+                    security_descriptor.as_ptr(),
+                    false,
+                ))
+            },
             None => {
                 debug!("File {} non esiste per get_security_by_name", path);
                 Err(STATUS_OBJECT_NAME_NOT_FOUND)
@@ -867,11 +1003,74 @@ impl FileSystemInterface for WinFspRemoteFs {
 
     fn create(
         &self,
-        _file_name: &U16CStr,
-        _create_file_info: CreateFileInfo,
+        file_name: &U16CStr,
+        create_file_info: CreateFileInfo,
         _security_descriptor: SecurityDescriptor,
     ) -> Result<(Self::FileContext, FileInfo), NTSTATUS> {
-        std::unreachable!("To be used, trait method must be overwritten !");
+        debug!(
+            "[WinFSP] create(file_name: {:?}, create_options: {:?})",
+            file_name, create_file_info.create_options
+        );
+
+        let path = file_name.to_os_string().to_string_lossy().into_owned();
+        let is_directory = create_file_info
+            .create_options
+            .is(CreateOptions::FILE_DIRECTORY_FILE);
+        
+        debug!("Tentativo creazione {}: {} con flags: 0x{:x}", 
+               if is_directory { "directory" } else { "file" }, 
+               path, create_file_info.create_options.0);
+
+        let mut client = self.client.lock().unwrap();
+        let normalized_path = client.normalize_path_for_server(&path);
+
+        let attrs = serde_json::json!({
+            "path": normalized_path,
+            "file_type": if is_directory { "Directory" } else { "RegularFile" },
+            "mode": create_file_info.file_attributes.0,
+            "uid": 1000,
+            "gid": 1000,
+            "atime": filetime_now(),
+            "mtime": filetime_now(),
+            "ctime": filetime_now(),
+            "crtime": filetime_now(),
+        });
+
+        match client.create_filesystem_object(attrs) {
+            Ok(metadata) => {
+                let file_handle = if !is_directory {
+                    // Per file regolari, aprilo immediatamente per ottenere handle
+                    match client.open_file(&path, create_file_info.create_options.0 as i32) {
+                        Ok(h) => {
+                            info!("File creato e aperto: {} -> handle {}", path, h);
+                            h
+                        }
+                        Err(_) => {
+                            error!("Impossibile aprire file appena creato: {}", path);
+                            return Err(STATUS_ACCESS_DENIED);
+                        }
+                    }
+                } else {
+                    // Per directory, usa l'ino come handle
+                    info!("Directory creata: {} -> ino {}", path, metadata.ino);
+                    metadata.ino as u64
+                };
+
+                // Registra il mapping handle -> path
+                {
+                    let mut handle_map = self.handle_to_path.lock().unwrap();
+                    handle_map.insert(file_handle, path.clone());
+                    debug!("Handle {} registrato per path {}", file_handle, path);
+                }
+
+                info!("Creazione completata: {} -> handle {}", path, file_handle);
+                Ok((file_handle as usize, metadata.to_file_info()))
+            }
+            Err(error_code) => {
+                error!("Errore creazione {}: code {}", path, error_code);
+                Err(STATUS_ACCESS_DENIED)
+            }
+        }
     }
 
     fn overwrite(
