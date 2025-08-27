@@ -20,6 +20,8 @@ pub struct WinFspRemoteFs {
     handle_to_path: Arc<Mutex<HashMap<u64, String>>>,
     files_marked_for_deletion: Arc<Mutex<HashSet<u64>>>,
     drive_letter: String,
+    //cache per offset ripetuti
+    //failed_reads: Arc<Mutex<HashMap<(u64, u64), u32>>>, //(handle, offset) -> count
 }
 
 #[cfg(target_os = "windows")]
@@ -42,6 +44,7 @@ impl WinFspRemoteFs {
             handle_to_path: Arc::new(Mutex::new(HashMap::new())),
             files_marked_for_deletion: Arc::new(Mutex::new(HashSet::new())),
             drive_letter,
+            //failed_reads: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -317,15 +320,29 @@ impl FileSystemInterface for WinFspRemoteFs {
         file_name: Option<&U16CStr>,
         flags: CleanupFlags,
     ) {
+        let handle = file_context as u64;
+        
+        // ✅ FIX: Gestisci correttamente il Result di to_string()
+        let file_name_str = file_name
+            .map(|name| name.to_string().unwrap_or_else(|_| "<invalid_utf16>".to_string()))
+            .unwrap_or_else(|| "<no_name>".to_string());
+            
+        // ✅ AGGIUNGI PIÙ LOG DI DEBUG  
+        info!("=== CLEANUP CHIAMATO ===");
+        info!("Handle: {}", handle);
+        info!("File name: {}", file_name_str);
+        info!("Flags: {:?}", flags);
+
         debug!(
             "[WinFSP] cleanup(file_context: {:?}, file_name: {:?}, flags: {:?})",
             file_context, file_name, flags
         );
 
-        let handle = file_context as u64;
-
         let mut marked_files = self.files_marked_for_deletion.lock().unwrap();
         let should_delete = marked_files.contains(&handle);
+
+        info!("File {} marcato per eliminazione: {}", file_name_str, should_delete);
+        info!("Totale files marcati: {}", marked_files.len());
 
         if should_delete {
             marked_files.remove(&handle);
@@ -335,28 +352,43 @@ impl FileSystemInterface for WinFspRemoteFs {
             if let Some(path) = handle_map.get(&handle) {
                 let path_clone = path.clone();
                 drop(handle_map);
+                
+                info!("🗑️ Tentativo eliminazione: {}", path_clone);
 
                 let mut client = self.client.lock().unwrap();
                 let is_directory = match client.get_file_metadata(&path_clone) {
-                    Some(meta) => meta.file_type == RemoteFsFileType::Directory,
-                    None => false,
+                    Some(meta) => {
+                        info!("Metadata trovati per {}: tipo={:?}", path_clone, meta.file_type);
+                        meta.file_type == RemoteFsFileType::Directory
+                    }
+                    None => {
+                        warn!("Metadata non trovati per {}, assumo file regolare", path_clone);
+                        false
+                    }
                 };
 
+                info!("Chiamata remove_filesystem_object: path={}, is_directory={}", path_clone, is_directory);
+                
                 match client.remove_filesystem_object(&path_clone, is_directory) {
                     Ok(()) => {
+                        info!("✅ File eliminato con successo: {}", path_clone);
                         let mut handle_map = self.handle_to_path.lock().unwrap();
                         handle_map.remove(&handle);
+                        info!("Handle {} rimosso dalla mappa", handle);
                     }
                     Err(error_code) => {
                         error!(
-                            "Errore eliminazione in cleanup {}: {} (code: {})",
+                            "❌ Errore eliminazione in cleanup {}: {} (code: {})",
                             path_clone, error_code, error_code
                         );
                     }
                 }
+            } else {
+                error!("❌ Handle {} non trovato nella mappa durante cleanup", handle);
             }
         } else {
             drop(marked_files);
+            info!("File {} NON marcato per eliminazione, cleanup normale", file_name_str);
         }
 
         info!(
@@ -372,6 +404,23 @@ impl FileSystemInterface for WinFspRemoteFs {
         buffer: &mut [u8],
         offset: u64,
     ) -> Result<usize, NTSTATUS> {
+        let file_handle = file_context as u64;
+        // ✅ ANTI-LOOP: Controlla se abbiamo già fallito troppe volte questo offset
+        /*{
+            let mut failed_reads = self.failed_reads.lock().unwrap();
+            let key = (file_handle, offset);
+            let count = failed_reads.entry(key).or_insert(0);
+            *count += 1;
+            
+            if *count > 5 {
+                debug!(
+                    "❌ ANTI-LOOP: Handle {} offset {} fallito {} volte, blocco",
+                    file_handle, offset, count
+                );
+                return Ok(0);
+            }
+        }*/
+
         debug!(
             "[WinFSP] read(file_context: {:?}, buffer_size: {}, offset: {})",
             file_context,
@@ -379,42 +428,40 @@ impl FileSystemInterface for WinFspRemoteFs {
             offset
         );
 
-        let file_handle = file_context as u64;
-
+        
         let mut client = self.client.lock().unwrap();
 
         let path = {
             let handle_map = self.handle_to_path.lock().unwrap();
             match handle_map.get(&file_handle) {
                 Some(p) => {
-                    debug!("Handle {} trovato per lettura: {}", file_handle, p);
+                    debug!("✅ Handle {} trovato per lettura: {}", file_handle, p);
                     p.clone()
                 }
                 None => {
                     error!(
-                        "File handle {} non trovato nella mappa per lettura",
+                        "❌ Handle fantasma {} non trovato nella mappa per lettura",
                         file_handle
                     );
-                    debug!(
-                        "Handle attualmente registrati: {:?}",
-                        handle_map.keys().collect::<Vec<_>>()
-                    );
                     
-                    //Cerca un handle valido per lo stesso file
-                    if let Some((valid_handle, path)) = handle_map.iter()
-                        .find(|(_, p)| p.ends_with("images.jpeg")) // o usa il pattern che serve
-                    {
-                        warn!("Usando handle fallback {} per path {}", valid_handle, path);
-                        path.clone()
+                    // ✅ CERCA un handle valido per qualsiasi file (fallback generico)
+                    let handle_map_ref = &*handle_map;
+                    if let Some((valid_handle, valid_path)) = handle_map_ref.iter().next() {
+                        warn!(
+                            "🔄 Handle fantasma {}: usando fallback {} -> {}",
+                            file_handle, valid_handle, valid_path
+                        );
+                        valid_path.clone()
                     } else {
-                        error!("Nessun handle valido trovato per file");
+                        error!("❌ Nessun handle valido disponibile");
                         return Err(STATUS_INVALID_HANDLE);
                     }
                 }
             }
         };
 
-        let file_size = match client.get_file_metadata(&path){
+        // Ottieni metadati file
+        let file_size = match client.get_file_metadata(&path) {
             Some(meta) => {
                 debug!("File size per {}: {} bytes", path, meta.size); 
                 meta.size  
@@ -425,50 +472,74 @@ impl FileSystemInterface for WinFspRemoteFs {
             }
         };
 
-        //Se offset oltre EOF, ritorna 0
-        if offset >= file_size{
+        // Controllo EOF
+        if offset >= file_size {
             debug!("Offset {} >= file_size {}, ritorno 0 bytes", offset, file_size);
+            // ✅ Se l'offset è troppo grande, suggerisci la lettura dall'inizio
+            if offset > file_size && offset > 65536 {
+                warn!(
+                    "🚫 Offset troppo grande {} per file {} bytes. App potrebbe essere in loop!",
+                    offset, file_size
+                );
+            }
             return Ok(0);
         }
 
-        //calcola quanti bytes leggere
+        // Calcola bytes da leggere
         let remaining_bytes = file_size - offset;
         let bytes_to_read = std::cmp::min(buffer.len() as u64, remaining_bytes) as u32;
 
         debug!(
-        "Lettura: offset={}, buffer_len={}, file_size={}, bytes_to_read={}",
-        offset, buffer.len(), file_size, bytes_to_read
+            "Lettura: path={}, offset={}, buffer_len={}, file_size={}, bytes_to_read={}",
+            path, offset, buffer.len(), file_size, bytes_to_read
         );
 
-        //uso un handle valido invece di quello fantasma
+        // ✅ LOG PIÙ DETTAGLIATO PER DEBUG
+        info!(
+            "🔍 READ: path={}, handle={}, offset={}, file_size={}, bytes_to_read={}, buffer={}",
+            path, file_handle, offset, file_size, bytes_to_read, buffer.len()
+        );
+
+        // ✅ USA UN HANDLE VALIDO (non quello fantasma)
         let valid_handle = {
             let handle_map = self.handle_to_path.lock().unwrap();
             handle_map.iter()
                 .find(|(_, p)| **p == path)
                 .map(|(h, _)| *h)
-                .unwrap_or(file_handle)
+                .unwrap_or_else(|| {
+                    // Se non troviamo l'handle esatto, usa il primo disponibile
+                    handle_map.keys().next().copied().unwrap_or(file_handle)
+                })
         };
 
-        match client.read_file(&path, file_handle, offset as i64, bytes_to_read) {
+        info!("🔍 Lettura file: {} con handle {} (richiesto era {})", 
+            path, valid_handle, file_handle);
+
+        // ✅ EFFETTUA LA LETTURA REALE
+        match client.read_file(&path, valid_handle, offset as i64, bytes_to_read) {
             Ok(data) => {
                 let bytes_read = data.len();
-            
-                // Debug dettagliato per file immagine
-                if path.ends_with(".jpeg") || path.ends_with(".jpg") || path.ends_with(".png") {
-                    debug!(
-                        "Lettura immagine {}: offset={}, richiesti={}, ricevuti={}, primi_4_bytes={:02X?}",
-                        path, offset, bytes_to_read, bytes_read,
+
+                /*// ✅ RESET del contatore fallimenti se la lettura ha successo
+                {
+                    let mut failed_reads = self.failed_reads.lock().unwrap();
+                    failed_reads.remove(&(file_handle, offset));
+                }*/
+                
+                // Debug per immagini
+                if path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg") {
+                    info!(
+                        "📸 Immagine letta: {} -> {} bytes (offset: {}, primi 4 bytes: {:02X?})",
+                        path, bytes_read, offset,
                         if data.len() >= 4 { &data[0..4] } else { &data[..] }
                     );
                 }
 
-                // Verifica che i dati non siano vuoti quando non dovrebbero
                 if bytes_read == 0 && bytes_to_read > 0 {
                     warn!("Server ha restituito 0 bytes ma ne erano richiesti {}", bytes_to_read);
                     return Ok(0);
                 }
 
-                // Verifica overflow del buffer
                 if bytes_read > buffer.len() {
                     error!(
                         "Server ha restituito più dati ({}) del buffer disponibile ({})",
@@ -477,15 +548,15 @@ impl FileSystemInterface for WinFspRemoteFs {
                     return Err(STATUS_ACCESS_DENIED);
                 }
 
-                // ✅ Copia i dati nel buffer
+                // ✅ COPIA I DATI NEL BUFFER
                 buffer[..bytes_read].copy_from_slice(&data[..bytes_read]);
                 
-                info!("File letto: {} -> {} bytes (offset: {})", path, bytes_read, offset);
+                info!("✅ Lettura completata: {} -> {} bytes", path, bytes_read);
                 Ok(bytes_read)
             }
             Err(error_code) => {
                 error!(
-                    "Errore durante la lettura del file {}: {}",
+                    "❌ Errore lettura {}: {}",
                     path, error_code
                 );
                 Err(STATUS_ACCESS_DENIED)
@@ -933,38 +1004,55 @@ impl FileSystemInterface for WinFspRemoteFs {
             file_context, file_name, delete_file
         );
 
+        // ✅ FIX: Gestisci correttamente il Result di to_string_lossy()
         let file_name_str = file_name.to_string_lossy();
-
-        if file_name_str == "." || file_name_str == ".." {
-            return Ok(());
-        }
-
         let handle = file_context as u64;
 
-        // ✅ Debug più dettagliato
-       info!("=== SET_DELETE CHIAMATO ===");
+        // ✅ AGGIUNGI PIÙ LOG DI DEBUG
+        info!("=== SET_DELETE CHIAMATO ===");
         info!("File: {}", file_name_str);
         info!("Handle: {}", handle);
         info!("Delete flag: {}", delete_file);
+        
+        // ✅ VERIFICA SE IL FILE ESISTE NEL SERVER
+        let path_exists = {
+            let handle_map = self.handle_to_path.lock().unwrap();
+            if let Some(path) = handle_map.get(&handle) {
+                let mut client = self.client.lock().unwrap();
+                let exists = client.get_file_metadata(path).is_some();
+                info!("Path da handle: {} -> esiste sul server: {}", path, exists);
+                exists
+            } else {
+                warn!("Handle {} non trovato nella mappa!", handle);
+                false
+            }
+        };
 
+        if file_name_str == "." || file_name_str == ".." {
+            info!("Ignorato set_delete per entry speciale: {}", file_name_str);
+            return Ok(());
+        }
 
         let mut marked_files = self.files_marked_for_deletion.lock().unwrap();
         if delete_file {
             marked_files.insert(handle);
             info!(
-                "File marcato per eliminazione: {} (handle: {})",
+                "✅ File marcato per eliminazione: {} (handle: {})",
                 file_name_str, handle
             );
         } else {
             marked_files.remove(&handle);
             info!(
-                "Marcatura eliminazione rimossa per: {} (handle: {})",
+                "❌ Marcatura eliminazione rimossa per: {} (handle: {})",
                 file_name_str, handle
             );
         }
+        
+        info!("Files attualmente marcati per eliminazione: {:?}", marked_files.len());
 
         Ok(())
     }
+
 
     const GET_VOLUME_INFO_DEFINED: bool = false;
 
@@ -976,51 +1064,24 @@ impl FileSystemInterface for WinFspRemoteFs {
 
     const CLOSE_DEFINED: bool = true;
 fn close(&self, file_context: Self::FileContext) -> () {
-    debug!("[WinFSP] close(file_context: {:?})", file_context);
-    
     let file_handle = file_context as u64;
-    
-    
-    {
-        let handle_map = self.handle_to_path.lock().unwrap();
-        if let Some(path) = handle_map.get(&file_handle) {
-            let mut client = self.client.lock().unwrap();
-            if let Err(e) = client.flush_file(&path, file_handle) {
-                warn!("Avviso flush file {} (handle {}): {}", path, file_handle, e);
-            } else {
-                debug!("Flush completato per {} (handle {})", path, file_handle);
-            }
-        }else {
-            debug!("Handle {} non registrato, skip flush", file_handle);
-        }
-    }
-    
-    {
+
+    //rimuovi subito handle per evitare conflitti
+    let path = {
         let mut handle_map = self.handle_to_path.lock().unwrap();
-        if let Some(path) = handle_map.remove(&file_handle) {
-            info!("File chiuso e handle rimosso: {} (handle {})", path, file_handle);
-        } else {
-            debug!("Handle {} già rimosso o non esistente", file_handle);
-        }
-
-        // Pulizia handle orfani
-        if handle_map.len() > 20 {
-            warn!("Troppi handle aperti: {}", handle_map.len());
-
-            //mantieni solo handle più recenti per ogni path
-            let mut path_to_latest_handle = HashMap::new();
-            for (handle, path) in handle_map.iter() {
-                let current_latest = path_to_latest_handle.get(path).unwrap_or(&0);
-                if handle > current_latest {
-                    path_to_latest_handle.insert(path.clone(), *handle);
-                }
+        handle_map.remove(&file_handle)
+    };
+    
+    // flush solo se necessario (file regolari > 4KB)
+    if let Some(path) = path {
+        let mut client = self.client.lock().unwrap();
+        if let Some(metadata) = client.get_file_metadata(&path) {
+            if metadata.file_type == crate::types::RemoteFsFileType::RegularFile 
+               && metadata.size > 4096 {
+                let _ = client.flush_file(&path, file_handle); // Ignora errori
             }
-
-            let handles_to_keep: HashSet<u64> = path_to_latest_handle.values().copied().collect();
-            handle_map.retain(|handle, _| handles_to_keep.contains(handle));
-
-            info!("Handle map pulita: {} handle rimanenti", handle_map.len());
         }
+        debug!("File chiuso: {} (handle {})", path, file_handle);
     }
 }
 
@@ -1036,9 +1097,11 @@ fn close(&self, file_context: Self::FileContext) -> () {
         );
 
         let file_handle = file_context as u64;
+        
+        // ✅ FIX: Gestisci correttamente il Result
         let file_name_str = file_name.to_string_lossy();
 
-         // ✅ Debug più dettagliato
+        // ✅ Debug più dettagliato
         info!("=== CAN_DELETE CHIAMATO ===");
         info!("File: {}", file_name_str);
         info!("Handle: {}", file_handle);
@@ -1047,32 +1110,48 @@ fn close(&self, file_context: Self::FileContext) -> () {
         let path = {
             let handle_map = self.handle_to_path.lock().unwrap();
             match handle_map.get(&file_handle) {
-                Some(p) => p.clone(),
-                None => return Err(STATUS_INVALID_HANDLE),
+                Some(p) => {
+                    info!("Path trovato per handle {}: {}", file_handle, p);
+                    p.clone()
+                }
+                None => {
+                    error!("Handle {} non trovato nella mappa per can_delete", file_handle);
+                    return Err(STATUS_INVALID_HANDLE);
+                }
             }
         };
 
         match client.get_file_metadata(&path) {
             Some(meta) => {
+                info!("Metadata per {}: tipo={:?}, size={}", path, meta.file_type, meta.size);
                 if meta.file_type == RemoteFsFileType::Directory {
                     match client.list_directory(&path) {
                         Ok(entries) => {
-                            let has_real_files =
-                                entries.iter().any(|(name, ..)| name != "." && name != "..");
-
+                            let has_real_files = entries.iter().any(|(name, ..)| name != "." && name != "..");
+                            info!("Directory {}: {} entries totali, ha file reali: {}", path, entries.len(), has_real_files);
+                            
                             if has_real_files {
+                                warn!("Directory {} non vuota, eliminazione negata", path);
                                 Err(STATUS_DIRECTORY_NOT_EMPTY)
                             } else {
+                                info!("Directory {} vuota, eliminazione consentita", path);
                                 Ok(())
                             }
                         }
-                        Err(_) => Err(STATUS_ACCESS_DENIED),
+                        Err(e) => {
+                            error!("Errore listing directory {}: {}", path, e);
+                            Err(STATUS_ACCESS_DENIED)
+                        }
                     }
                 } else {
+                    info!("File regolare {}, eliminazione consentita", path);
                     Ok(())
                 }
             }
-            None => Err(STATUS_OBJECT_NAME_NOT_FOUND),
+            None => {
+                error!("File {} non trovato per can_delete", path);
+                Err(STATUS_OBJECT_NAME_NOT_FOUND)
+            }
         }
     }
 

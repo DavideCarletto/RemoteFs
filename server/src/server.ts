@@ -56,14 +56,18 @@ app.get('/list', (req, res) => {
 // Read file content endpoint
 app.get('/files', (req, res) => {
   const path = req.query.path as string;
-  const file_handle = req.query.file_handle as string;
+  //const file_handle = req.query.file_handle as string;
   const offset = parseInt(req.query.offset as string) || 0;
   const size = parseInt(req.query.size as string) || 0;
-  const chunk_index = parseInt(req.query.chunk_index as string) || 0;
+  //const chunk_index = parseInt(req.query.chunk_index as string) || 0;
 
-  if (!path || !file_handle) {
-    return res.status(400).json({ error: 'Path and file handle are required' });
+
+  if (!path) {
+    return res.status(400).json({ error: "Path parameter is required" });
   }
+  /*if (!path || !file_handle) {
+    return res.status(400).json({ error: 'Path and file handle are required' });
+  }*/
 
   try {
     const metadata = sqliteBackend.getFileMetadataByPath(path);
@@ -71,13 +75,13 @@ app.get('/files', (req, res) => {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    if (metadata.file_type !== 'RegularFile') {
+    /*if (metadata.file_type !== 'RegularFile') {
       return res.status(400).json({ error: 'Cannot read directory or special file' });
-    }
+    }*/
 
     const startOffset = Math.max(0, offset);
-    const requestedSize = size || (metadata.size - startOffset);
-
+    //const requestedSize = size || (metadata.size - startOffset);
+    const requestedSize = Math.min(size, 1024*1024); //max 1MB per request
     // Calcola la dimensione effettiva da leggere (non può essere più grande del file)
     const actualEndOffset = Math.min(startOffset + requestedSize - 1, metadata.size - 1);
     const actualSize = Math.max(0, actualEndOffset - startOffset + 1);
@@ -443,6 +447,34 @@ app.patch("/metadata", (req, res) => {
     res.json(updatedMetadata);
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.patch('/flush', (req, res) => {
+  const { file_handle, filePath } = req.body;
+  
+  if (!filePath) {
+    return res.status(400).json({ error: "filePath richiesto" });
+  }
+
+  try {
+    // Per le directory, il flush non è necessario
+    const metadata = sqliteBackend.getFileMetadataByPath(filePath);
+    if (!metadata) {
+      return res.status(404).json({ error: "File non trovato" });
+    }
+
+    if (metadata.file_type === "Directory") {
+      // Per le directory, restituiamo OK senza fare nulla
+      return res.status(200).json({ message: "Directory flush completed" });
+    }
+
+    // Per i file regolari, aggiorna la dimensione
+    sqliteBackend.updateFileSize(filePath);
+    res.status(200).json({ message: "File flushed successfully" });
+  } catch (err) {
+    console.error('[FLUSH ERROR]', err);
+    res.status(500).json({ error: "Errore durante il flush" });
   }
 });
 

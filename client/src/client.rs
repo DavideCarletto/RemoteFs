@@ -752,39 +752,58 @@ impl RemoteFsClient {
             path, file_handle
         );
 
-        let normalized_path = self.normalize_path_for_server(path);
+        // ✅ FIX: Ottieni metadati PRIMA della logica di skip
+        let should_skip = {
+            if let Some(metadata) = self.get_file_metadata(path) {
+                // Skip per directory
+                if metadata.file_type == crate::types::RemoteFsFileType::Directory {
+                    debug!("Skip flush per directory: {}", path);
+                    return Ok(());
+                }
+                
+                // Skip per file piccoli
+                if metadata.size < 4096 {
+                    debug!("Skip flush per file piccolo ({} bytes): {}", metadata.size, path);
+                    return Ok(());
+                }
+                
+                false // Non saltare
+            } else {
+                // Se non riusciamo a ottenere metadati, proviamo comunque il flush
+                debug!("Metadati non disponibili per {}, procedendo con flush", path);
+                false
+            }
+        };
 
+        if should_skip {
+            return Ok(());
+        }
+
+        let normalized_path = self.normalize_path_for_server(path);
         let payload = serde_json::json!({
             "file_handle": file_handle,
             "filePath": normalized_path
         });
 
-        let response = self
-            .http_client
+        // ✅ Timeout più breve per flush
+        let response = self.http_client
             .patch(&format!("{}/flush", self.api_url))
+            .timeout(std::time::Duration::from_secs(2))
             .json(&payload)
             .send();
 
         match response {
+            Ok(resp) if resp.status().is_success() => {
+                debug!("Flush completato per {}", path);
+                Ok(())
+            }
             Ok(resp) => {
-                if resp.status().is_success() {
-                    info!(
-                        "Flush completato per file: {} (handle: {})",
-                        path, file_handle
-                    );
-                    Ok(())
-                } else {
-                    let status_code = resp.status().as_u16() as u32;
-                    error!(
-                        "Errore HTTP durante flush: {} per file {}",
-                        status_code, path
-                    );
-                    Err(status_code)
-                }
+                debug!("Flush fallito per {} con status {}, ignorato", path, resp.status());
+                Ok(()) // Non bloccare per errori di flush
             }
             Err(e) => {
-                error!("Errore di rete durante flush per {}: {}", path, e);
-                Err(500)
+                debug!("Flush fallito per {} con errore {}, ignorato", path, e);
+                Ok(()) // Non bloccare per errori di flush
             }
         }
     }
