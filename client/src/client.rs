@@ -5,7 +5,7 @@ use std::time::Duration;
 use crate::cache::FileSystemCache;
 use crate::types::{FileMetadata, RemoteFsFileType};
 
-const CHUNK_SIZE: usize = 64 * 1024;
+const CHUNK_SIZE: usize = 4 * 1024;
 
 pub struct RemoteFsClient {
     api_url: String,
@@ -129,29 +129,32 @@ impl RemoteFsClient {
         let url = format!("{}/metadata?path={}", self.api_url, server_path);
 
         match self.http_client.get(&url).send() {
-            Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
-                Ok(metadata) => {
-                    info!(
-                        "Metadati ricevuti per {}: inode {}",
-                        server_path, metadata.ino
-                    );
-                    Some(metadata)
-                }
-                Err(e) => {
-                    error!("Errore parsing JSON per {}: {}", server_path, e);
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    match resp.json::<FileMetadata>() {
+                        Ok(metadata) => {
+                            info!(
+                                "Metadati ricevuti per {}: inode {}",
+                                server_path, metadata.ino
+                            );
+                            Some(metadata)
+                        }
+                        Err(e) => {
+                            error!("Errore parsing JSON per {}: {}", server_path, e);
+                            None
+                        }
+                    }
+                } else if status == reqwest::StatusCode::NOT_FOUND {
+                    debug!("File non trovato: {}", server_path);
+                    None
+                } else {
+                    error!("Errore server per {}: {}", server_path, status);
                     None
                 }
-            },
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                warn!("File non trovato: {}", server_path);
-                None
-            }
-            Ok(resp) => {
-                error!("Errore server per {}: {}", server_path, resp.status());
-                None
             }
             Err(e) => {
-                error!("Errore di rete per {}: {}", server_path, e);
+                error!("Errore HTTP per {}: {}", server_path, e);
                 None
             }
         }
@@ -268,7 +271,10 @@ impl RemoteFsClient {
         match self
             .http_client
             .delete(&url)
-            .query(&[("path", server_path.clone()), ("is_directory", is_directory.to_string())])
+            .query(&[
+                ("path", server_path.clone()),
+                ("is_directory", is_directory.to_string()),
+            ])
             .send()
         {
             Ok(resp) => match resp.status() {
@@ -451,15 +457,18 @@ impl RemoteFsClient {
 
                     let url = format!("{}/files", self.api_url);
 
-                    let request_data = serde_json::json!({
-                        "path": server_path,
-                        "file_handle": file_handle,
-                        "offset": current_offset,
-                        "size": current_chunk_size,
-                        "chunk_index": chunk_index
-                    });
-
-                    match self.http_client.get(&url).json(&request_data).send() {
+                    match self
+                        .http_client
+                        .get(&url)
+                        .query(&[
+                            ("path", server_path.as_str()),
+                            ("file_handle", &file_handle.to_string()),
+                            ("offset", &current_offset.to_string()),
+                            ("size", &current_chunk_size.to_string()),
+                            ("chunk_index", &chunk_index.to_string()),
+                        ])
+                        .send()
+                    {
                         Ok(resp) if resp.status().is_success() => match resp.bytes() {
                             Ok(chunk_data) => {
                                 result.extend_from_slice(&chunk_data);
@@ -638,7 +647,6 @@ impl RemoteFsClient {
         }
     }
 
-    /// Scrive dati in un file sul server tramite chiamata HTTP con streaming
     pub fn write_file(
         &self,
         path: &str,
@@ -736,5 +744,48 @@ impl RemoteFsClient {
             total_written, total_chunks
         );
         Ok(total_written)
+    }
+
+    pub fn flush_file(&mut self, path: &str, file_handle: u64) -> Result<(), u32> {
+        debug!(
+            "Richiesta flush per file: {} (handle: {})",
+            path, file_handle
+        );
+
+        let normalized_path = self.normalize_path_for_server(path);
+
+        let payload = serde_json::json!({
+            "file_handle": file_handle,
+            "filePath": normalized_path
+        });
+
+        let response = self
+            .http_client
+            .patch(&format!("{}/flush", self.api_url))
+            .json(&payload)
+            .send();
+
+        match response {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    info!(
+                        "Flush completato per file: {} (handle: {})",
+                        path, file_handle
+                    );
+                    Ok(())
+                } else {
+                    let status_code = resp.status().as_u16() as u32;
+                    error!(
+                        "Errore HTTP durante flush: {} per file {}",
+                        status_code, path
+                    );
+                    Err(status_code)
+                }
+            }
+            Err(e) => {
+                error!("Errore di rete durante flush per {}: {}", path, e);
+                Err(500)
+            }
+        }
     }
 }

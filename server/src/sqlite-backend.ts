@@ -2,11 +2,36 @@ import Database from 'better-sqlite3';
 import {INode} from './server'
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 
 export interface FileHandle {
-  file_handle: number;  //id file aperto
-  flags: number;   //flag apertura
-  path: string;   //percorso del file
+  file_handle: number; 
+  flags: number; 
+  path: string;
+}
+
+// Ottiene UID/GID reali del sistema
+function getSystemUID(): number {
+  try {
+    const userInfo = os.userInfo();
+    return userInfo.uid || 1000;
+  } catch {
+    return 1000;
+  }
+}
+
+function getSystemGID(): number {
+  try {
+    const userInfo = os.userInfo();
+    return userInfo.gid || 1000;
+  } catch {
+    return 1000;
+  }
+}
+
+// Ottiene timestamp Unix corrente
+function nowUnix(): number {
+  return Math.floor(Date.now() / 1000);
 }
 
 export class SQLiteBackend {
@@ -117,7 +142,7 @@ export class SQLiteBackend {
     uid?: number;
     gid?: number;
   }): number {
-    const now = Math.floor(Date.now() / 1000);
+    const now = nowUnix();
     const stmt = this.db.prepare(`
         INSERT INTO fs_nodes (
           path, parent_ino, name, file_type, size, permissions, uid, gid,
@@ -128,13 +153,13 @@ export class SQLiteBackend {
          )
         `);
     const info = stmt.run({
-        path: params.path,
-        parent_ino: params.parent_ino,
-        name: params.name,
-        permissions: params.mode ?? 0o644,
-        uid: params.uid ?? 1000,
-        gid: params.gid ?? 1000,
-        now
+      path: params.path,
+      parent_ino: params.parent_ino,
+      name: params.name,
+      permissions: params.mode ?? 0o644,
+      uid: params.uid ?? getSystemUID(),
+      gid: params.gid ?? getSystemGID(),
+      now
     });
     return info.lastInsertRowid as number;
   }
@@ -155,18 +180,18 @@ export class SQLiteBackend {
   //elenca contenuto directory
   listDirectory(path: string): Array<{ ino: number; name: string; file_type: string }> {
     let entries: Array<{ ino: number; name: string; file_type: string }> = [];
-    
+
     const dirIno = path === '/' ? 1 : this.getInodeByPath(path);
-    
+
     if (dirIno !== undefined) {
-      
+
       const stmt = this.db.prepare(`
         SELECT ino, name, file_type 
         FROM fs_nodes 
         WHERE parent_ino = ?
         ORDER BY name
       `);
-      
+
       try {
         entries = stmt.all(dirIno) as Array<{ ino: number; name: string; file_type: string }>;
       } catch (error) {
@@ -175,7 +200,7 @@ export class SQLiteBackend {
     } else {
       console.error(`[LISTDIR] Directory not found: ${path}`);
     }
-    
+
     return entries;
   }
 
@@ -188,7 +213,7 @@ export class SQLiteBackend {
     uid?: number;
     gid?: number;
   }): number {
-    const now = Math.floor(Date.now() / 1000);
+    const now = nowUnix();
     const stmt = this.db.prepare(`
       INSERT INTO fs_nodes (
         path, parent_ino, name, file_type, size, permissions, uid, gid,
@@ -198,26 +223,26 @@ export class SQLiteBackend {
         @now, @now, @now, @now, 8, 512, 2
       )
     `);
-    
+
     const info = stmt.run({
       path: params.path,
       parent_ino: params.parent_ino,
       name: params.name,
       permissions: params.mode ?? 0o755,
-      uid: params.uid ?? 1000,
-      gid: params.gid ?? 1000,
+      uid: params.uid ?? getSystemUID(),
+      gid: params.gid ?? getSystemGID(),
       now
     });
-    
+
     return info.lastInsertRowid as number;
   }
 
   //elimina un file o directory
   deleteNode(path: string, isDirectory?: boolean): { success: boolean; error?: string } {
-    
+
     const checkStmt = this.db.prepare('SELECT ino, file_type FROM fs_nodes WHERE path = ?');
     const node = checkStmt.get(path) as { ino: number; file_type: string } | undefined;
-    
+
     if (!node) {
       return { success: false, error: 'no_such_file_or_directory' };
     }
@@ -270,22 +295,23 @@ export class SQLiteBackend {
     return handle;
   }
 
-  // Streaming di lettura
   readFile(path: string, options?: { start?: number; end?: number }): fs.ReadStream | null {
     const stmt = this.db.prepare('SELECT ino FROM fs_nodes WHERE path = ?');
     const result = stmt.get(path) as { ino: number } | undefined;
-    
+
     if (!result) {
       return null;
     }
 
+    this.updateAccessTime(path);
+
     const filePath = `${this.filesystemDir}/${result.ino}`;
-    
+
     try {
       if (!fs.existsSync(filePath)) {
         return null;
       }
-      
+
       return fs.createReadStream(filePath, options);
     } catch (error) {
       console.error(`[FS] Error creating read stream for ${filePath}:`, error);
@@ -293,36 +319,62 @@ export class SQLiteBackend {
     }
   }
 
-  // Streaming di scrittura
+  // Streaming di scrittura con aggiornamento mtime
   writeFile(path: string, options?: { start?: number }): fs.WriteStream | null {
     const stmt = this.db.prepare('SELECT ino FROM fs_nodes WHERE path = ?');
     const result = stmt.get(path) as { ino: number } | undefined;
-    
+
     if (!result) {
       return null;
     }
 
     const filePath = `${this.filesystemDir}/${result.ino}`;
-    
+
     try {
-      return fs.createWriteStream(filePath, options);
+      if (!fs.existsSync(filePath)) {
+        fs.writeFileSync(filePath, '');
+      }
+
+      const writeStream = fs.createWriteStream(filePath, { start: options?.start, flags: 'r+' });
+
+      let chunkCount = 0;
+      writeStream.on('pipe', () => {
+        console.log(`[FS WRITESTREAM] ${path}: stream collegato, inizio scrittura su file ${filePath}`);
+      });
+
+      writeStream.on('pipe', () => {
+        this.updateModificationTime(path);
+      });
+
+      const originalWrite = writeStream.write.bind(writeStream);
+      writeStream.write = function (chunk: any, encoding?: any, cb?: any) {
+        chunkCount++;
+        if (Buffer.isBuffer(chunk)) {
+          const preview = chunk.subarray(0, 16);
+          const hexPreview = Array.from(preview).map(b => b.toString(16).padStart(2, '0')).join(' ');
+          console.log(`[FS WRITESTREAM] ${path}: chunk ${chunkCount} di ${chunk.length} bytes, primi 16: [${hexPreview}]`);
+        }
+        return originalWrite(chunk, encoding, cb);
+      };
+
+      return writeStream;
     } catch (error) {
       console.error(`[FS] Error creating write stream for ${filePath}:`, error);
       return null;
     }
   }
 
-  // Aggiorna dimensione file dopo streaming
+  // Aggiorna dimensione file dopo streaming e modifica mtime
   updateFileSize(path: string): void {
     const stmt = this.db.prepare('SELECT ino FROM fs_nodes WHERE path = ?');
     const result = stmt.get(path) as { ino: number } | undefined;
-    
+
     if (!result) {
       return;
     }
 
     const filePath = `${this.filesystemDir}/${result.ino}`;
-    
+
     try {
       if (fs.existsSync(filePath)) {
         const stats = fs.statSync(filePath);
@@ -333,12 +385,39 @@ export class SQLiteBackend {
               blocks = ?
           WHERE ino = ?
         `);
-        
-        const now = Math.floor(Date.now() / 1000);
+
+        const now = nowUnix();
         updateStmt.run(stats.size, now, Math.ceil(stats.size / 512), result.ino);
       }
     } catch (error) {
       console.error(`[FS] Error updating file size for ${filePath}:`, error);
+    }
+  }
+
+  private updateAccessTime(path: string): void {
+    try {
+      const updateStmt = this.db.prepare(`
+        UPDATE fs_nodes 
+        SET atime = ?
+        WHERE path = ?
+      `);
+      updateStmt.run(nowUnix(), path);
+    } catch (error) {
+      console.error(`[FS] Error updating access time for ${path}:`, error);
+    }
+  }
+
+  private updateModificationTime(path: string): void {
+    try {
+      const updateStmt = this.db.prepare(`
+        UPDATE fs_nodes 
+        SET mtime = ?, ctime = ?
+        WHERE path = ?
+      `);
+      const now = nowUnix();
+      updateStmt.run(now, now, path);
+    } catch (error) {
+      console.error(`[FS] Error updating modification time for ${path}:`, error);
     }
   }
 
@@ -360,7 +439,7 @@ export class SQLiteBackend {
             ctime = ?
         WHERE ino = ?
       `);
-      
+
       const now = Math.floor(Date.now() / 1000);
       const newName = newPath.split('/').pop() || '';
       updateStmt.run(newPath, newName, now, now, node.ino);
@@ -370,7 +449,7 @@ export class SQLiteBackend {
         SET path = replace(path, ?, ?)
         WHERE path LIKE ?
       `);
-      
+
       updateChildrenStmt.run(oldPath + '/', newPath + '/', oldPath + '/%');
     })();
   }
@@ -437,7 +516,7 @@ export class SQLiteBackend {
         WHERE path = @path
         RETURNING *
       `);
-      
+
       return stmt.get(params) as INode;
     }
 

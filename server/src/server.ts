@@ -28,7 +28,7 @@ export interface INode {
 
 // List directory content endpoint
 app.get('/list', (req, res) => {
-  
+
   const path = req.query.path as string;
 
   if (!path) {
@@ -46,7 +46,7 @@ app.get('/list', (req, res) => {
     }
 
     const entries = sqliteBackend.listDirectory(path);
-    
+
     res.json({ entries });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
@@ -55,9 +55,13 @@ app.get('/list', (req, res) => {
 
 // Read file content endpoint
 app.get('/files', (req, res) => {
-  const { path, file_handle, offset, size, chunk_index } = req.body;
+  const path = req.query.path as string;
+  const file_handle = req.query.file_handle as string;
+  const offset = parseInt(req.query.offset as string) || 0;
+  const size = parseInt(req.query.size as string) || 0;
+  const chunk_index = parseInt(req.query.chunk_index as string) || 0;
 
-  if (!path || file_handle === undefined) {
+  if (!path || !file_handle) {
     return res.status(400).json({ error: 'Path and file handle are required' });
   }
 
@@ -71,47 +75,46 @@ app.get('/files', (req, res) => {
       return res.status(400).json({ error: 'Cannot read directory or special file' });
     }
 
-    const startOffset = Math.max(0, offset || 0);
+    const startOffset = Math.max(0, offset);
     const requestedSize = size || (metadata.size - startOffset);
-    
+
     // Calcola la dimensione effettiva da leggere (non può essere più grande del file)
     const actualEndOffset = Math.min(startOffset + requestedSize - 1, metadata.size - 1);
     const actualSize = Math.max(0, actualEndOffset - startOffset + 1);
-    
-    
-    const readStream = sqliteBackend.readFile(path, { 
-      start: startOffset, 
+
+
+    const readStream = sqliteBackend.readFile(path, {
+      start: startOffset,
       end: actualEndOffset
     });
-    
+
     if (!readStream) {
       return res.status(500).json({ error: 'Failed to create read stream' });
     }
 
     res.set('Content-Type', 'application/octet-stream');
     res.set('Content-Length', actualSize.toString());
-    
+
     readStream.on('error', (error: Error) => {
+      console.error(`[READ ERROR] ${path}:`, error);
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Stream error' });
+        res.status(500).json({ error: 'Stream read error' });
       }
     });
 
-    if (chunk_index !== undefined) {
-    }
-
     readStream.pipe(res);
   } catch (err) {
+    console.error(`[READ CATCH ERROR] ${path}:`, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Write file content endpoint
 app.put('/files', (req, res) => {
-  
   const path = req.headers['x-path'] as string;
   const file_handle = req.headers['x-file-handle'] as string;
   const offset = parseInt(req.headers['x-offset'] as string);
+  const expectedSize = parseInt(req.headers['content-length'] as string) || 0;
 
   if (!path || !file_handle || isNaN(offset)) {
     return res.status(400).json({ error: 'Required headers: x-path, x-file-handle, x-offset' });
@@ -127,7 +130,6 @@ app.put('/files', (req, res) => {
       return res.status(400).json({ error: 'Cannot write to directory or special file' });
     }
 
-    
     const writeStream = sqliteBackend.writeFile(path, { start: offset });
     if (!writeStream) {
       return res.status(500).json({ error: 'Failed to create write stream' });
@@ -136,6 +138,7 @@ app.put('/files', (req, res) => {
     let totalBytesWritten = 0;
 
     writeStream.on('error', (error) => {
+      console.error(`[WRITE ERROR] ${path}:`, error);
       if (!res.headersSent) {
         res.status(500).json({ error: 'Stream write error' });
       }
@@ -144,16 +147,23 @@ app.put('/files', (req, res) => {
     writeStream.on('finish', () => {
       try {
         sqliteBackend.updateFileSize(path);
+        const updates = {
+          mtime: Math.floor(Date.now() / 1000)
+        };
+        sqliteBackend.updateMetadata(path, updates);
+
         const updatedMetadata = sqliteBackend.getFileMetadataByPath(path);
-        
+
         if (!res.headersSent) {
-          res.json({ 
+          res.json({
             bytes_written: totalBytesWritten,
             new_size: updatedMetadata?.size,
-            message: 'Streaming write successful'
+            offset_written: offset,
+            message: 'Write successful'
           });
         }
       } catch (err) {
+        console.error(`[WRITE FINISH ERROR] ${path}:`, err);
         if (!res.headersSent) {
           res.status(500).json({ error: 'Error updating file metadata' });
         }
@@ -162,19 +172,22 @@ app.put('/files', (req, res) => {
 
     req.on('data', (chunk: Buffer) => {
       totalBytesWritten += chunk.length;
-      
-      if (totalBytesWritten % (10 * 1024 * 1024) === 0) {
-      }
+      // Log dei primi 16 byte di ogni chunk ricevuto dal server
+      const preview = chunk.subarray(0, 16);
+      const hexPreview = Array.from(preview).map(b => b.toString(16).padStart(2, '0')).join(' ');
+      console.log(`[SERVER CHUNK] ${path}: ricevuto chunk di ${chunk.length} bytes, primi 16: [${hexPreview}]`);
     });
 
     req.on('error', (error) => {
+      console.error(`[WRITE REQ ERROR] ${path}:`, error);
       if (!res.headersSent) {
-        res.status(500).json({ error: 'Error processing file data' });
+        res.status(500).json({ error: 'Error processing request' });
       }
     });
 
     req.pipe(writeStream);
   } catch (err) {
+    console.error(`[WRITE CATCH ERROR] ${path}:`, err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -182,11 +195,11 @@ app.put('/files', (req, res) => {
 // Endpoint per creare file regolari
 app.post('/files', (req, res) => {
   const { path, file_type, mode, uid, gid, rdev, umask } = req.body;
-  
+
   if (!path || !file_type) {
     return res.status(400).json({ error: "Path e file_type sono richiesti" });
   }
-  
+
   if (file_type !== "RegularFile") {
     return res.status(400).json({ error: "Questo endpoint supporta solo RegularFile" });
   }
@@ -196,7 +209,7 @@ app.post('/files', (req, res) => {
     if (existingFile) {
       return res.status(409).json({ error: "File già esistente" });
     }
-    
+
     const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
     const parentIno = sqliteBackend.getInodeByPath(parentPath);
     if (!parentIno) {
@@ -211,7 +224,7 @@ app.post('/files', (req, res) => {
       uid,
       gid
     });
-    
+
     const metadata = sqliteBackend.getFileMetadataByIno(ino);
     res.status(201).json(metadata);
   } catch (err) {
@@ -223,11 +236,11 @@ app.post('/files', (req, res) => {
 // Endpoint per creare directory
 app.post("/mkdir", (req, res) => {
   const { path, file_type, mode, uid, gid, rdev, umask } = req.body;
-  
+
   if (!path || !file_type) {
     return res.status(400).json({ error: "Path e file_type sono richiesti" });
   }
-  
+
   if (file_type !== "Directory") {
     return res.status(400).json({ error: "Questo endpoint supporta solo Directory" });
   }
@@ -237,13 +250,13 @@ app.post("/mkdir", (req, res) => {
     if (existingDir) {
       return res.status(409).json({ error: "Directory già esistente" });
     }
-    
+
     const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
     const parentIno = sqliteBackend.getInodeByPath(parentPath);
     if (!parentIno) {
       return res.status(404).json({ error: "Directory padre non trovata" });
     }
-    
+
     const name = path.split('/').pop() || path;
     const ino = sqliteBackend.createDirectory({
       path,
@@ -253,7 +266,7 @@ app.post("/mkdir", (req, res) => {
       uid,
       gid
     });
-    
+
     const metadata = sqliteBackend.getFileMetadataByIno(ino);
     res.status(201).json(metadata);
   } catch (err) {
@@ -266,26 +279,26 @@ app.post("/mkdir", (req, res) => {
 app.delete("/files", (req, res) => {
   const path = req.query.path as string;
   const isDirectory = req.query.is_directory === 'true';
-  
+
   if (!path) {
     return res.status(400).json({ error: "Path richiesto" });
   }
-  
+
   try {
     const fileToRemove = sqliteBackend.getFileMetadataByPath(path);
     if (!fileToRemove) {
       return res.status(404).json({ error: "File non trovato" });
     }
-    
+
     const isActuallyDirectory = fileToRemove.file_type === "Directory";
     if (isDirectory && !isActuallyDirectory) {
       return res.status(400).json({ error: "Non è una directory" });
     }
-    
+
     if (!isDirectory && isActuallyDirectory) {
       return res.status(400).json({ error: "È una directory, usa rmdir" });
     }
-    
+
     const result = sqliteBackend.deleteNode(path, isDirectory);
     if (!result.success) {
       switch (result.error) {
@@ -301,7 +314,7 @@ app.delete("/files", (req, res) => {
           return res.status(500).json({ error: "Errore durante la rimozione" });
       }
     }
-    
+
     res.status(200).json({ message: "Rimosso con successo" });
   } catch (err) {
     res.status(500).json({ error: "Errore durante la rimozione" });
@@ -311,22 +324,22 @@ app.delete("/files", (req, res) => {
 // Endpoint per aprire file
 app.post("/open", (req, res) => {
   const { path, flags } = req.body;
-  
+
   if (!path) {
     return res.status(400).json({ error: "Path richiesto" });
   }
-  
+
   try {
     const file = sqliteBackend.getFileMetadataByPath(path);
     if (!file) {
       return res.status(404).json({ error: "File non trovato" });
     }
-    
+
     // Controlla che non sia una directory (a meno che non sia opendir)
     if (file.file_type === "Directory") {
       return res.status(400).json({ error: "È una directory, usa opendir" });
     }
-    
+
     const fileHandle = sqliteBackend.openFile({ path, flags });
     res.status(200).json(fileHandle);
   } catch (err) {
@@ -336,9 +349,9 @@ app.post("/open", (req, res) => {
 
 // Endpoint per rinominare/spostare file e directory
 app.post('/rename', (req, res) => {
-  
+
   const { old_path, new_path } = req.body;
-  
+
   if (!old_path || !new_path) {
     return res.status(400).json({ error: 'Both old_path and new_path are required' });
   }
@@ -367,7 +380,7 @@ app.post('/rename', (req, res) => {
     sqliteBackend.renameNode(old_path, new_path);
     const updatedMetadata = sqliteBackend.getFileMetadataByPath(new_path);
 
-    res.json({ 
+    res.json({
       message: 'File renamed successfully',
       old_path,
       new_path,
@@ -405,8 +418,10 @@ app.get("/metadata", (req, res) => {
   if (!path) {
     return res.status(400).json({ error: "Path richiesto" });
   }
-  
+
   try {
+    sqliteBackend.updateFileSize(path);
+    
     const metadata = sqliteBackend.getFileMetadataByPath(path);
     if (!metadata) {
       return res.status(404).json({ error: "File non trovato" });
@@ -414,6 +429,36 @@ app.get("/metadata", (req, res) => {
     res.json(metadata);
   } catch (err) {
     res.status(500).json({ error: "Errore durante il recupero dei metadati" });
+  }
+});
+
+// Flush endpoint - SEPARATO dagli altri
+app.patch('/flush', (req, res) => {
+  const { file_handle, filePath } = req.body;
+
+  if (!filePath) {
+    return res.status(400).json({ error: 'filePath required' });
+  }
+
+  try {
+    sqliteBackend.updateFileSize(filePath);
+
+    // Aggiorna mtime
+    const updates = {
+      mtime: Math.floor(Date.now() / 1000)
+    };
+
+    const updatedNode = sqliteBackend.updateMetadata(filePath, updates);
+
+    if (updatedNode) {
+      res.json({ success: true, metadata: updatedNode });
+    } else {
+      console.error(`[FLUSH] File non trovato: ${filePath}`);
+      res.status(404).json({ error: 'File not found' });
+    }
+  } catch (error) {
+    console.error(`[FLUSH ERROR] ${filePath}:`, error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -442,6 +487,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   - GET /files/ - Legge il contenuto di un file`);
   console.log(`   - PUT /files/ - Scrive il contenuto di un file`);
   console.log(`   - POST /files/ - Crea un file regolare`);
+  console.log(`   - PATCH /flush - Flush del file`);
   console.log(`   - POST /mkdir/ - Crea una directory`);
   console.log(`   - DELETE /files/ Cancella un file o una directory`);
   console.log(`   - GET /health - Health check`);
@@ -453,4 +499,3 @@ app.listen(PORT, '0.0.0.0', () => {
 });
 
 export { app };
-  
