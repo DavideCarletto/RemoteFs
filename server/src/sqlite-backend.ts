@@ -339,7 +339,6 @@ export class SQLiteBackend {
 
       let chunkCount = 0;
       writeStream.on('pipe', () => {
-        console.log(`[FS WRITESTREAM] ${path}: stream collegato, inizio scrittura su file ${filePath}`);
       });
 
       writeStream.on('pipe', () => {
@@ -352,7 +351,6 @@ export class SQLiteBackend {
         if (Buffer.isBuffer(chunk)) {
           const preview = chunk.subarray(0, 16);
           const hexPreview = Array.from(preview).map(b => b.toString(16).padStart(2, '0')).join(' ');
-          console.log(`[FS WRITESTREAM] ${path}: chunk ${chunkCount} di ${chunk.length} bytes, primi 16: [${hexPreview}]`);
         }
         return originalWrite(chunk, encoding, cb);
       };
@@ -364,7 +362,7 @@ export class SQLiteBackend {
     }
   }
 
-  // Aggiorna dimensione file dopo streaming e modifica mtime
+  // Aggiorna dimensione file dopo streaming (solo size e blocks, non mtime)
   updateFileSize(path: string): void {
     const stmt = this.db.prepare('SELECT ino FROM fs_nodes WHERE path = ?');
     const result = stmt.get(path) as { ino: number } | undefined;
@@ -381,13 +379,11 @@ export class SQLiteBackend {
         const updateStmt = this.db.prepare(`
           UPDATE fs_nodes 
           SET size = ?, 
-              mtime = ?,
               blocks = ?
           WHERE ino = ?
         `);
 
-        const now = nowUnix();
-        updateStmt.run(stats.size, now, Math.ceil(stats.size / 512), result.ino);
+        updateStmt.run(stats.size, Math.ceil(stats.size / 512), result.ino);
       }
     } catch (error) {
       console.error(`[FS] Error updating file size for ${filePath}:`, error);
@@ -411,11 +407,11 @@ export class SQLiteBackend {
     try {
       const updateStmt = this.db.prepare(`
         UPDATE fs_nodes 
-        SET mtime = ?, ctime = ?
+        SET mtime = ?
         WHERE path = ?
       `);
       const now = nowUnix();
-      updateStmt.run(now, now, path);
+      updateStmt.run(now, path);
     } catch (error) {
       console.error(`[FS] Error updating modification time for ${path}:`, error);
     }
@@ -435,14 +431,13 @@ export class SQLiteBackend {
         UPDATE fs_nodes 
         SET path = ?,
             name = ?,
-            mtime = ?,
             ctime = ?
         WHERE ino = ?
       `);
 
       const now = Math.floor(Date.now() / 1000);
       const newName = newPath.split('/').pop() || '';
-      updateStmt.run(newPath, newName, now, now, node.ino);
+      updateStmt.run(newPath, newName, now, node.ino);
 
       const updateChildrenStmt = this.db.prepare(`
         UPDATE fs_nodes 

@@ -901,23 +901,13 @@ impl FileSystemInterface for WinFspRemoteFs {
         
         let file_handle = file_context as u64;
         
-        // Flush finale al close del file
-        let path = {
-            let handle_map = self.handle_to_path.lock().unwrap();
-            handle_map.get(&file_handle).cloned()
-        };
-        
-        if let Some(path) = path {
-            let mut client = self.client.lock().unwrap();
-            match client.flush_file(&path, file_handle) {
-                Ok(()) => {
-                    info!("Flush finale completato al close: {} (handle {})", path, file_handle);
-                }
-                Err(e) => {
-                    error!("Flush finale fallito al close {} (handle {}): {}", path, file_handle, e);
-                }
+        {
+            let mut handle_map = self.handle_to_path.lock().unwrap();
+            if let Some(path) = handle_map.remove(&file_handle) {
+                info!("File chiuso e handle rimosso: {} (handle {})", path, file_handle);
             }
         }
+        
     }
 
     const CAN_DELETE_DEFINED: bool = true;

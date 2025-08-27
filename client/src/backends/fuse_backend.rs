@@ -996,33 +996,13 @@ impl Filesystem for FuseRemoteFs {
     fn flush(
         &mut self,
         _req: &fuser::Request<'_>,
-        ino: u64,
-        fh: u64,
+        _ino: u64,
+        _fh: u64,
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
-        debug!("flush(ino: {:#x}, fh: {})", ino, fh);
-        
-        // Converte l'inode in path
-        let path = match self.client.inode_to_path(ino) {
-            Some(p) => p,
-            None => {
-                error!("Path non trovato per ino: {:#x}", ino);
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        match self.client.flush_file(&path, fh) {
-            Ok(()) => {
-                info!("Flush completato per {} (ino: {:#x}, fh: {})", path, ino, fh);
-                reply.ok();
-            }
-            Err(error_code) => {
-                error!("Errore durante flush per {} (ino: {:#x}, fh: {}): {}", path, ino, fh, error_code);
-                reply.error(error_code as i32);
-            }
-        }
+        debug!("flush(ino: {:#x}, fh: {})", _ino, _fh);
+        reply.ok();
     }
 
     fn getxattr(

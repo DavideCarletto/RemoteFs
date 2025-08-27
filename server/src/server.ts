@@ -175,7 +175,6 @@ app.put('/files', (req, res) => {
       // Log dei primi 16 byte di ogni chunk ricevuto dal server
       const preview = chunk.subarray(0, 16);
       const hexPreview = Array.from(preview).map(b => b.toString(16).padStart(2, '0')).join(' ');
-      console.log(`[SERVER CHUNK] ${path}: ricevuto chunk di ${chunk.length} bytes, primi 16: [${hexPreview}]`);
     });
 
     req.on('error', (error) => {
@@ -420,8 +419,6 @@ app.get("/metadata", (req, res) => {
   }
 
   try {
-    sqliteBackend.updateFileSize(path);
-    
     const metadata = sqliteBackend.getFileMetadataByPath(path);
     if (!metadata) {
       return res.status(404).json({ error: "File non trovato" });
@@ -429,36 +426,6 @@ app.get("/metadata", (req, res) => {
     res.json(metadata);
   } catch (err) {
     res.status(500).json({ error: "Errore durante il recupero dei metadati" });
-  }
-});
-
-// Flush endpoint - SEPARATO dagli altri
-app.patch('/flush', (req, res) => {
-  const { file_handle, filePath } = req.body;
-
-  if (!filePath) {
-    return res.status(400).json({ error: 'filePath required' });
-  }
-
-  try {
-    sqliteBackend.updateFileSize(filePath);
-
-    // Aggiorna mtime
-    const updates = {
-      mtime: Math.floor(Date.now() / 1000)
-    };
-
-    const updatedNode = sqliteBackend.updateMetadata(filePath, updates);
-
-    if (updatedNode) {
-      res.json({ success: true, metadata: updatedNode });
-    } else {
-      console.error(`[FLUSH] File non trovato: ${filePath}`);
-      res.status(404).json({ error: 'File not found' });
-    }
-  } catch (error) {
-    console.error(`[FLUSH ERROR] ${filePath}:`, error);
-    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -487,7 +454,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   - GET /files/ - Legge il contenuto di un file`);
   console.log(`   - PUT /files/ - Scrive il contenuto di un file`);
   console.log(`   - POST /files/ - Crea un file regolare`);
-  console.log(`   - PATCH /flush - Flush del file`);
   console.log(`   - POST /mkdir/ - Crea una directory`);
   console.log(`   - DELETE /files/ Cancella un file o una directory`);
   console.log(`   - GET /health - Health check`);
