@@ -1,0 +1,1026 @@
+use log::{debug, error, info, warn};
+use reqwest::blocking::Client;
+use std::time::Duration;
+
+use crate::cache::FileSystemCache;
+use crate::types::{FileMetadata, RemoteFsFileType};
+
+const CHUNK_SIZE: usize = 4 * 1024;
+
+pub struct RemoteFsClient {
+    api_url: String,
+    http_client: Client,
+    cache: FileSystemCache,
+}
+
+impl RemoteFsClient {
+    pub fn new(api_url: String) -> Self {
+        let cache = FileSystemCache::with_default();
+
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .build()
+            .expect("Errore creazione HTTP client");
+
+        Self {
+            api_url,
+            http_client,
+            cache,
+        }
+    }
+
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    pub fn cache(&self) -> &FileSystemCache {
+        &self.cache
+    }
+
+    //ottiene riferimento mutabile a cache
+    pub fn cache_mut(&mut self) -> &mut FileSystemCache {
+        &mut self.cache
+    }
+
+    pub fn normalize_path_for_server(&self, path: &str) -> String {
+        #[cfg(target_os = "windows")]
+        {
+            if path == "\\" || path == "/" {
+                return "/".to_string();
+            }
+            let replaced = path.replace("\\", "/");
+            let collapsed = replaced
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("/{}", collapsed)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            path.to_string()
+        }
+    }
+
+    pub fn test_connection(&self) -> Result<(), String> {
+        let health_url = format!("{}/health", self.api_url);
+
+        match self.http_client.get(&health_url).send() {
+            Ok(resp) if resp.status().is_success() => Ok(()),
+            Ok(resp) => Err(format!("Errore connessione al server: {}", resp.status())),
+            Err(e) => Err(format!("Errore di rete: {}", e)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Risolve un inode in percorso tramite chiamata HTTP al server
+    pub fn inode_to_path(&self, ino: u64) -> Option<String> {
+        debug!("Risoluzione inode {} in percorso via HTTP", ino);
+        if ino == 1 {
+            info!("Inode {} risolto in percorso: /", ino);
+            return Some("/".to_string());
+        }
+
+        let url = format!("{}/resolve-inode/{}", self.api_url, ino);
+        match self.http_client.get(&url).send() {
+            Ok(resp) if resp.status().is_success() => match resp.text() {
+                Ok(path) => {
+                    info!("Inode {} risolto in percorso: {}", ino, path);
+                    Some(self.normalize_path_for_server(&path))
+                }
+                Err(e) => {
+                    error!("Errore lettura risposta per inode {}: {}", ino, e);
+                    None
+                }
+            },
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("Inode {} non trovato sul server - tentativo di debug", ino);
+                debug!("URL richiesta: {}", url);
+                None
+            }
+            Ok(resp) => {
+                error!("Errore server per inode {}: {}", ino, resp.status());
+                None
+            }
+            Err(e) => {
+                error!("Errore di rete per inode {}: {}", ino, e);
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn build_path(&self, parent: u64, name: &str) -> Option<String> {
+        let parent_path = self.inode_to_path(parent)?;
+        let normalized_parent = self.normalize_path_for_server(&parent_path);
+
+        if normalized_parent == "/" {
+            Some(format!("/{}", name))
+        } else {
+            Some(format!("{}/{}", normalized_parent, name))
+        }
+    }
+
+    /// Richiede i metadati di un file al server (con cache)
+    pub fn get_file_metadata(&mut self, path: &str) -> Option<FileMetadata> {
+        let server_path = self.normalize_path_for_server(path);
+
+        if let Some(cached_metadata) = self.cache.get_metadata_by_path(&server_path) {
+            debug!("CACHE HIT: metadata per {}", server_path);
+            return Some(cached_metadata);
+        }
+
+        debug!(
+            "CACHE MISS: richiedendo metadata dal server per {}",
+            server_path
+        );
+        let url = format!("{}/metadata?path={}", self.api_url, server_path);
+
+        match self.http_client.get(&url).send() {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    match resp.json::<FileMetadata>() {
+                        Ok(metadata) => {
+                            info!(
+                                "Metadati ricevuti per {}: inode {}",
+                                server_path, metadata.ino
+                            );
+                            //salvo in cache per le prossime volte
+                            self.cache
+                                .cache_metadata(server_path.clone(), metadata.clone());
+                            debug!("Metadati memorizzati in cache per {}", server_path);
+                            Some(metadata)
+                        }
+                        Err(e) => {
+                            error!("Errore parsing JSON per {}: {}", server_path, e);
+                            None
+                        }
+                    }
+                } else if status == reqwest::StatusCode::NOT_FOUND {
+                    debug!("File non trovato: {}", server_path);
+                    None
+                } else {
+                    error!("Errore server per {}: {}", server_path, status);
+                    None
+                }
+            }
+            Err(e) => {
+                error!("Errore HTTP per {}: {}", server_path, e);
+                None
+            }
+        }
+    }
+
+    /// Aggiorna gli attributi di un file
+    pub fn update_file_metadata(
+        &mut self,
+        path: &str,
+        updates: serde_json::Value,
+    ) -> Option<FileMetadata> {
+        let server_path = self.normalize_path_for_server(path);
+
+        debug!(
+            "Aggiornamento attributi per: {} con {:?}",
+            server_path, updates
+        );
+
+        let url = format!("{}/metadata?path={}", self.api_url, server_path);
+
+        match self.http_client.patch(&url).json(&updates).send() {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.text() {
+                    Ok(text) => {
+                        debug!("Risposta server per {}: {}", server_path, text);
+                        match serde_json::from_str::<FileMetadata>(&text) {
+                            Ok(metadata) => {
+                                info!(
+                                    "Attributi aggiornati per {}: inode {}",
+                                    server_path, metadata.ino
+                                );
+                                
+                                self.cache.invalidate_path(&server_path);
+                                debug!("Cache invalidata per file aggiornato: {}", server_path);
+                                
+                                Some(metadata)
+                            }
+                            Err(e) => {
+                                error!("Errore parsing JSON per {}: {} - Response: {}", server_path, e, text);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Errore lettura risposta per {}: {}", server_path, e);
+                        None
+                    }
+                }
+            }
+            Ok(resp) => {
+                error!("Errore server per {}: {}", server_path, resp.status());
+                None
+            }
+            Err(e) => {
+                error!("Errore di rete per {}: {}", server_path, e);
+                None
+            }
+        }
+    }
+
+    pub fn create_filesystem_object(
+        &mut self,
+        request_data: serde_json::Value,
+    ) -> Result<FileMetadata, i32> {
+        let file_type = request_data
+            .get("file_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("RegularFile");
+
+        let url = if file_type == "Directory" {
+            format!("{}/mkdir", self.api_url)
+        } else {
+            format!("{}/files", self.api_url)
+        };
+
+        match self.http_client.post(&url).json(&request_data).send() {
+            Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
+                Ok(metadata) => {
+                    info!("{} creato (server-side): inode {}", file_type, metadata.ino);
+
+                    if let Some(path) = request_data.get("path").and_then(|v| v.as_str()) {
+                        let server_path = self.normalize_path_for_server(path);
+                        if let Some(parent_pos) = server_path.rfind('/') {
+                            let parent_path = if parent_pos == 0 {
+                                "/"
+                            } else {
+                                &server_path[..parent_pos]
+                            };
+                            self.cache.invalidate_directory(parent_path);
+                            debug!(
+                                "Cache directory padre invalidata dopo creazione: {}",
+                                parent_path
+                            );
+                        }
+                    }
+                    Ok(metadata)
+                }
+                Err(e) => {
+                    error!("Parsing JSON fallito in create_filesystem_object: {}", e);
+                    Err(libc::EIO)
+                }
+            },
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                warn!("Conflitto creazione oggetto filesystem: già esistente");
+                Err(libc::EEXIST)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("Directory padre non trovata");
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                warn!("Permessi insufficienti per creazione oggetto filesystem");
+                Err(libc::EACCES)
+            }
+            Ok(resp) => {
+                error!(
+                    "Errore server nella creazione oggetto filesystem: {}",
+                    resp.status()
+                );
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete nella creazione oggetto filesystem: {}", e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Rimuove un filesystem object (file, directory, etc.) dal server tramite chiamata HTTP
+    pub fn remove_filesystem_object(&mut self, path: &str, is_directory: bool) -> Result<(), i32> {
+        let server_path = self.normalize_path_for_server(path);
+
+        debug!(
+            "Rimozione filesystem object: {} (directory: {})",
+            server_path, is_directory
+        );
+
+        if let None = self.get_file_metadata(&server_path) {
+            error!("File non trovato per rimozione: {}", server_path);
+            return Err(libc::ENOENT);
+        }
+
+        let url = format!("{}/files", self.api_url);
+
+        match self
+            .http_client
+            .delete(&url)
+            .query(&[
+                ("path", server_path.clone()),
+                ("is_directory", is_directory.to_string()),
+            ])
+            .send()
+        {
+            Ok(resp) => match resp.status() {
+                reqwest::StatusCode::OK => {
+                    info!("Filesystem object rimosso: {}", server_path);
+                    
+                    if is_directory {
+                        self.cache.invalidate_directory(&server_path);
+                        debug!("Cache directory invalidata per: {}", server_path);
+                    } else {
+                        self.cache.invalidate_path(&server_path);
+                        debug!("Cache file invalidata per: {}", server_path);
+                    }
+                    
+                    self.cache.invalidate_path(&server_path);
+                    debug!("Cache metadati invalidata per oggetto rimosso: {}", server_path);
+
+                    if let Some(parent_pos) = server_path.rfind('/') {
+                        let parent_path = if parent_pos == 0 {
+                            "/"
+                        } else {
+                            &server_path[..parent_pos]
+                        };
+                        self.cache.invalidate_directory(parent_path);
+                        debug!("Cache directory padre invalidata per: {}", parent_path);
+                    }
+
+                    Ok(())
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    warn!("File non trovato per rimozione: {}", server_path);
+                    Err(libc::ENOENT)
+                }
+                reqwest::StatusCode::FORBIDDEN => {
+                    warn!("Permessi insufficienti per rimuovere: {}", server_path);
+                    Err(libc::EACCES)
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    if let Ok(response_text) = resp.text() {
+                        if response_text.contains("directory not empty") {
+                            warn!("Directory non vuota: {}", server_path);
+                            Err(libc::ENOTEMPTY)
+                        } else {
+                            warn!("File in uso: {}", server_path);
+                            Err(libc::EBUSY)
+                        }
+                    } else {
+                        warn!("Directory non vuota o file in uso: {}", server_path);
+                        Err(libc::ENOTEMPTY)
+                    }
+                }
+                _ => {
+                    error!(
+                        "Errore server in rimozione per {}: {}",
+                        server_path,
+                        resp.status()
+                    );
+                    Err(libc::EIO)
+                }
+            },
+            Err(e) => {
+                if e.is_timeout() {
+                    error!("Timeout durante la rimozione di {}: {}", server_path, e);
+                    Err(libc::ETIMEDOUT)
+                } else if e.is_connect() {
+                    error!(
+                        "Errore di connessione durante la rimozione di {}: {}",
+                        server_path, e
+                    );
+                    Err(libc::ECONNREFUSED)
+                } else {
+                    error!("Errore di rete in rimozione per {}: {}", server_path, e);
+                    Err(libc::EIO)
+                }
+            }
+        }
+    }
+
+    /// Apre un file e restituisce un file handle
+    pub fn open_file(&mut self, path: &str, flags: i32) -> Result<u64, i32> {
+        debug!("Apertura file: {} con flags: {:#x}", path, flags);
+        let server_path = self.normalize_path_for_server(path);
+
+        if let Some(metadata) = self.get_file_metadata(&server_path) {
+            if metadata.file_type == RemoteFsFileType::Directory {
+                debug!("Directory {} aperta", server_path);
+                let dir_handle = metadata.ino;
+                return Ok(dir_handle);
+            }
+        }
+
+        let url = format!("{}/open", self.api_url);
+
+        let open_data = serde_json::json!({
+            "path": server_path,
+            "flags": flags
+        });
+
+        match self.http_client.post(&url).json(&open_data).send() {
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>() {
+                Ok(response) => {
+                    if let Some(fh) = response.get("file_handle").and_then(|v| v.as_u64()) {
+                        info!("File aperto: {} -> file handle {}", server_path, fh);
+                        Ok(fh)
+                    } else {
+                        error!(
+                            "Risposta server non valida per apertura {}: manca file_handle",
+                            server_path
+                        );
+                        Err(libc::EIO)
+                    }
+                }
+                Err(e) => {
+                    error!("Errore parsing JSON in apertura per {}: {}", server_path, e);
+                    Err(libc::EIO)
+                }
+            },
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per apertura: {}", server_path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::FORBIDDEN => {
+                warn!("Permessi insufficienti per aprire: {}", server_path);
+                Err(libc::EACCES)
+            }
+            Ok(resp) => {
+                error!(
+                    "Errore server in apertura per {}: {}",
+                    server_path,
+                    resp.status()
+                );
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in apertura per {}: {}", server_path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Legge dati da un file sul server tramite chiamata HTTP con streaming
+    pub fn read_file(
+        &mut self,
+        path: &str,
+        file_handle: u64,
+        offset: i64,
+        size: u32,
+    ) -> Result<Vec<u8>, i32> {
+        let server_path = self.normalize_path_for_server(path);
+
+        if offset >= 0 {
+            if let Some(metadata) = self.get_file_metadata(&server_path) {
+                if offset as u64 >= metadata.size {
+                    debug!(
+                        "EOF raggiunto: offset {} >= file size {}",
+                        offset, metadata.size
+                    );
+                    return Ok(Vec::new());
+                }
+
+                let remaining = metadata.size - offset as u64;
+                let read_size = size.min(remaining as u32);
+
+                if read_size == 0 {
+                    return Ok(Vec::new());
+                }
+
+                if offset == 0 && read_size <= 1024 * 1024 {
+                    if let Some(cached_data) =
+                        self.cache.get_file_content(&server_path, metadata.size)
+                    {
+                        let end = (read_size as usize).min(cached_data.len());
+
+                        return Ok(cached_data[..end].to_vec());
+                    }
+                }
+
+                debug!(
+                    "Lettura file in streaming: {} (fh: {}, offset: {}, size: {})",
+                    server_path, file_handle, offset, read_size
+                );
+
+                let mut result = Vec::new();
+                let mut current_offset = offset;
+                let mut remaining_size = read_size;
+                let mut chunk_index = 0;
+
+                info!(
+                    "Inizio lettura streaming: offset={}, size={} bytes, chunk_size={}KB",
+                    offset,
+                    read_size,
+                    CHUNK_SIZE / 1024
+                );
+
+                while remaining_size > 0 {
+                    let current_chunk_size = std::cmp::min(remaining_size, CHUNK_SIZE as u32);
+
+                    debug!(
+                        "Lettura chunk {}: offset={}, size={} bytes",
+                        chunk_index, current_offset, current_chunk_size
+                    );
+
+                    let url = format!("{}/files", self.api_url);
+
+                    match self
+                        .http_client
+                        .get(&url)
+                        .query(&[
+                            ("path", server_path.as_str()),
+                            ("file_handle", &file_handle.to_string()),
+                            ("offset", &current_offset.to_string()),
+                            ("size", &current_chunk_size.to_string()),
+                            ("chunk_index", &chunk_index.to_string()),
+                        ])
+                        .send()
+                    {
+                        Ok(resp) if resp.status().is_success() => match resp.bytes() {
+                            Ok(chunk_data) => {
+                                result.extend_from_slice(&chunk_data);
+                                current_offset += current_chunk_size as i64;
+                                remaining_size -= current_chunk_size;
+                                chunk_index += 1;
+
+                                if chunk_index % 100 == 0 {
+                                    let progress = ((read_size - remaining_size) as f64
+                                        / read_size as f64)
+                                        * 100.0;
+                                    info!(
+                                        "Progresso lettura streaming: {:.1}% ({}/{} bytes)",
+                                        progress,
+                                        read_size - remaining_size,
+                                        read_size
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Errore lettura chunk {} per {}: {}", chunk_index, path, e);
+                                return Err(libc::EIO);
+                            }
+                        },
+                        Ok(resp) => {
+                            error!(
+                                "Errore server lettura chunk {} per {}: {}",
+                                chunk_index,
+                                server_path,
+                                resp.status()
+                            );
+                            return Err(libc::EIO);
+                        }
+                        Err(e) => {
+                            error!(
+                                "Errore rete lettura chunk {} per {}: {}",
+                                chunk_index, server_path, e
+                            );
+                            return Err(libc::EIO);
+                        }
+                    }
+                }
+
+                debug!(
+                    "Lettura streaming completata: {} chunks totali, {} bytes totali",
+                    chunk_index,
+                    result.len()
+                );
+                //salva contenuto file in cache (se leggibile completamente)
+                if offset == 0
+                    && result.len() <= 1024 * 1024
+                    && result.len() == metadata.size as usize
+                {
+                    self.cache.cache_file_content(
+                        server_path.clone(),
+                        result.clone(),
+                        metadata.size,
+                    );
+                    debug!(
+                        "file content cached per {} ({} bytes)",
+                        server_path,
+                        result.len()
+                    );
+                }
+                return Ok(result);
+            }
+        }
+        Err(libc::ENOENT)
+    }
+
+    pub fn list_directory(
+        &mut self,
+        path: &str,
+    ) -> Result<Vec<(String, u64, RemoteFsFileType)>, i32> {
+        let server_path = self.normalize_path_for_server(path);
+
+        if let Some(cached_entries) = self.cache.get_directory_entries(&server_path) {
+            debug!("CACHE HIT: directory entries per {}", server_path);
+            let result = cached_entries
+                .into_iter()
+                .map(|entry| {
+                    let file_type = {
+                        #[cfg(target_os = "linux")]
+                        {
+                            match entry.file_type {
+                                fuser::FileType::Directory => RemoteFsFileType::Directory,
+                                fuser::FileType::RegularFile => RemoteFsFileType::RegularFile,
+                                _ => RemoteFsFileType::RegularFile,
+                            }
+                        }
+
+                        #[cfg(target_os = "windows")]
+                        {
+                            match entry.file_type.as_str() {
+                                "Directory" => RemoteFsFileType::Directory,
+                                "RegularFile" => RemoteFsFileType::RegularFile,
+                                _ => RemoteFsFileType::RegularFile,
+                            }
+                        }
+                    };
+                    (entry.name, entry.ino, file_type)
+                })
+                .collect();
+            return Ok(result);
+        }
+
+        debug!(
+            "CACHE MISS: richiedendo directory entries dal server per {}",
+            server_path
+        );
+
+        let response = self
+            .http_client
+            .get(&format!("{}/list", self.api_url))
+            .query(&[("path", server_path.clone())])
+            .send();
+
+        match response {
+            Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>() {
+                Ok(data) => {
+                    if let Some(entries) = data.get("entries").and_then(|v| v.as_array()) {
+                        let mut result = Vec::new();
+
+                        for entry in entries {
+                            if let (Some(name), Some(ino), Some(file_type)) = (
+                                entry.get("name").and_then(|v| v.as_str()),
+                                entry.get("ino").and_then(|v| v.as_u64()),
+                                entry.get("file_type").and_then(|v| v.as_str()),
+                            ) {
+                                let file_type = match file_type {
+                                    "Directory" => RemoteFsFileType::Directory,
+                                    "RegularFile" => RemoteFsFileType::RegularFile,
+                                    _ => RemoteFsFileType::RegularFile,
+                                };
+                                result.push((name.to_string(), ino, file_type));
+                            }
+                        }
+
+                        info!(
+                            "Directory {} contiene {} elementi",
+                            &server_path,
+                            result.len()
+                        );
+                        let cache_entries: Vec<_> = entries
+                            .iter()
+                            .filter_map(|entry| {
+                                if let (Some(name), Some(ino), Some(file_type_str)) = (
+                                    entry.get("name").and_then(|v| v.as_str()),
+                                    entry.get("ino").and_then(|v| v.as_u64()),
+                                    entry.get("file_type").and_then(|v| v.as_str()),
+                                ) {
+                                    // mappa la stringa in RemoteFsFileType
+                                    #[cfg(target_os = "linux")]
+                                    let file_type = match file_type_str {
+                                        "Directory" => fuser::FileType::Directory,
+                                        "RegularFile" => fuser::FileType::RegularFile,
+                                        _ => fuser::FileType::RegularFile,
+                                    };
+
+                                    #[cfg(target_os = "windows")]
+                                    let file_type = match file_type_str {
+                                        "Directory" => RemoteFsFileType::Directory,
+                                        "RegularFile" => RemoteFsFileType::RegularFile,
+                                        _ => RemoteFsFileType::RegularFile,
+                                    };
+
+                                    Some((name.to_string(), ino, file_type))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        #[cfg(target_os = "linux")]
+                        let cache_entries_for_cache: Vec<_> = cache_entries
+                            .iter()
+                            .map(|(name, ino, file_type)| {
+                                let ft_for_cache = match file_type {
+                                    fuser::FileType::Directory => fuser::FileType::Directory,
+                                    fuser::FileType::RegularFile => fuser::FileType::RegularFile,
+                                    _ => fuser::FileType::RegularFile,
+                                };
+                                (name.clone(), *ino, ft_for_cache)
+                            })
+                            .collect();
+
+                        #[cfg(target_os = "windows")]
+                        let cache_entries_for_cache: Vec<_> = cache_entries
+                            .iter()
+                            .map(|(name, ino, file_type)| {
+                                let ft_for_cache = match file_type {
+                                    RemoteFsFileType::Directory => "Directory".to_string(),
+                                    RemoteFsFileType::RegularFile => "RegularFile".to_string(),
+                                };
+                                (name.clone(), *ino, ft_for_cache)
+                            })
+                            .collect();
+
+                        self.cache
+                            .cache_directory_entries(server_path.clone(), cache_entries_for_cache);
+
+                        debug!("Directory entries memorizzate in cache per {}", server_path);
+                        Ok(result)
+                    } else {
+                        error!(
+                            "Risposta server non valida per listdir {}: manca entries",
+                            server_path
+                        );
+                        Err(libc::ENOENT)
+                    }
+                }
+                Err(e) => {
+                    error!("Errore parsing JSON per listdir {}: {}", server_path, e);
+                    Err(libc::EIO)
+                }
+            },
+            Ok(resp) => {
+                error!(
+                    "Errore server in listdir per {}: {}",
+                    server_path,
+                    resp.status()
+                );
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!("Errore di rete in listdir per {}: {}", server_path, e);
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    /// Rinomina/sposta un file o directory sul server tramite chiamata HTTP
+    pub fn rename_filesystem_object(&mut self, old_path: &str, new_path: &str) -> Result<(), i32> {
+        let old_server_path = self.normalize_path_for_server(old_path);
+        let new_server_path = self.normalize_path_for_server(new_path);
+        debug!(
+            "Rinomina filesystem object: {} -> {}",
+            old_server_path, new_server_path
+        );
+
+        let url = format!("{}/rename", self.api_url);
+
+        let rename_data = serde_json::json!({
+            "old_path": old_server_path,
+            "new_path": new_server_path
+        });
+
+        match self.http_client.post(&url).json(&rename_data).send() {
+            Ok(resp) if resp.status().is_success() => {
+                info!(
+                    "Filesystem object rinominato: {} -> {}",
+                    old_server_path, new_server_path
+                );
+
+                self.cache.invalidate_path(&old_server_path);
+                debug!("Invalidazione cache per vecchio path: {}", old_server_path);
+
+                self.cache.invalidate_path(&new_server_path);
+                debug!("Invalidazione cache per nuovo path: {}", new_server_path);
+
+                if let Some(parent_pos) = old_server_path.rfind('/') {
+                    let parent_path = if parent_pos == 0 {
+                        "/"
+                    } else {
+                        &old_server_path[..parent_pos]
+                    };
+                    self.cache.invalidate_directory(parent_path);
+                    debug!("Cache directory padre invalidata: {}", parent_path);
+                }
+
+                if let Some(parent_pos) = new_server_path.rfind('/') {
+                    let parent_path = if parent_pos == 0 {
+                        "/"
+                    } else {
+                        &new_server_path[..parent_pos]
+                    };
+                    self.cache.invalidate_directory(parent_path);
+                    debug!("Cache directory padre invalidata: {}", parent_path);
+                }
+
+                Ok(())
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
+                warn!("File non trovato per rinomina: {}", old_server_path);
+                Err(libc::ENOENT)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                warn!("File destinazione già esistente: {}", new_server_path);
+                Err(libc::EEXIST)
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST => {
+                warn!(
+                    "Operazione di rinomina non valida: {} -> {}",
+                    old_server_path, new_server_path
+                );
+                Err(libc::EINVAL)
+            }
+            Ok(resp) => {
+                error!(
+                    "Errore server in rinomina per {} -> {}: {}",
+                    old_server_path,
+                    new_server_path,
+                    resp.status()
+                );
+                Err(libc::EIO)
+            }
+            Err(e) => {
+                error!(
+                    "Errore di rete in rinomina per {} -> {}: {}",
+                    old_server_path, new_server_path, e
+                );
+                Err(libc::EIO)
+            }
+        }
+    }
+
+    pub fn write_file(
+        &mut self,
+        path: &str,
+        file_handle: u64,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<u32, i32> {
+        let server_path = self.normalize_path_for_server(path);
+        debug!(
+            "Scrittura file in streaming: {} (fh: {}, offset: {}, size: {})",
+            server_path,
+            file_handle,
+            offset,
+            data.len()
+        );
+
+        let chunks: Vec<&[u8]> = data.chunks(CHUNK_SIZE).collect();
+        let total_chunks = chunks.len();
+        let mut total_written = 0u32;
+
+        info!(
+            "Inizio scrittura streaming: {} chunks da {}KB ciascuno",
+            total_chunks,
+            CHUNK_SIZE / 1024
+        );
+
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
+            let chunk_offset = offset + (chunk_index * CHUNK_SIZE) as i64;
+
+            debug!(
+                "Scrittura chunk {}/{} ({}KB)",
+                chunk_index + 1,
+                total_chunks,
+                chunk.len() / 1024
+            );
+
+            let url = format!("{}/files", self.api_url);
+            let response = self
+                .http_client
+                .put(&url)
+                .header("Content-Type", "application/octet-stream")
+                .header("X-Path", &server_path)
+                .header("X-File-Handle", file_handle.to_string())
+                .header("X-Offset", chunk_offset.to_string())
+                .body(chunk.to_vec())
+                .send();
+
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<serde_json::Value>() {
+                        Ok(response_data) => {
+                            if let Some(bytes_written) =
+                                response_data.get("bytes_written").and_then(|v| v.as_u64())
+                            {
+                                total_written += bytes_written as u32;
+
+                                // Progress feedback ogni 50 chunk
+                                if chunk_index % 50 == 0 && total_chunks > 1 {
+                                    let progress =
+                                        ((chunk_index + 1) as f32 / total_chunks as f32) * 100.0;
+                                    info!(
+                                        "Chunk {}/{} completato - Progresso: {:.1}%",
+                                        chunk_index + 1,
+                                        total_chunks,
+                                        progress
+                                    );
+                                }
+                            } else {
+                                error!(
+                                    "Risposta server non valida per chunk {}: manca bytes_written",
+                                    chunk_index
+                                );
+                                return Err(libc::EIO);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Errore parsing JSON per chunk {}: {}", chunk_index, e);
+                            return Err(libc::EIO);
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    error!("Errore server per chunk {}: {}", chunk_index, resp.status());
+                    return Err(libc::EIO);
+                }
+                Err(e) => {
+                    error!("Errore di rete per chunk {}: {}", chunk_index, e);
+                    return Err(libc::EIO);
+                }
+            }
+        }
+
+        info!(
+            "Scrittura streaming completata: {} bytes scritti in {} chunks",
+            total_written, total_chunks
+        );
+
+        self.cache.invalidate_path(&server_path);
+        debug!("Invalidazione cache per file scritto: {}", server_path);
+
+        Ok(total_written)
+    }
+
+    pub fn flush_file(&mut self, path: &str, file_handle: u64) -> Result<(), u32> {
+        debug!(
+            "Richiesta flush per file: {} (handle: {})",
+            path, file_handle
+        );
+
+        let should_skip = {
+            if let Some(metadata) = self.get_file_metadata(path) {
+                if metadata.file_type == crate::types::RemoteFsFileType::Directory {
+                    debug!("Skip flush per directory: {}", path);
+                    return Ok(());
+                }
+
+                if metadata.size < 4096 {
+                    debug!(
+                        "Skip flush per file piccolo ({} bytes): {}",
+                        metadata.size, path
+                    );
+                    return Ok(());
+                }
+
+                false
+            } else {
+                debug!(
+                    "Metadati non disponibili per {}, procedendo con flush",
+                    path
+                );
+                false
+            }
+        };
+
+        if should_skip {
+            return Ok(());
+        }
+
+        let normalized_path = self.normalize_path_for_server(path);
+        let payload = serde_json::json!({
+            "file_handle": file_handle,
+            "filePath": normalized_path
+        });
+
+        let response = self
+            .http_client
+            .patch(&format!("{}/flush", self.api_url))
+            .timeout(std::time::Duration::from_secs(2))
+            .json(&payload)
+            .send();
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                debug!("Flush completato per {}", path);
+                Ok(())
+            }
+            Ok(resp) => {
+                debug!(
+                    "Flush fallito per {} con status {}, ignorato",
+                    path,
+                    resp.status()
+                );
+                Ok(()) 
+            }
+            Err(e) => {
+                debug!("Flush fallito per {} con errore {}, ignorato", path, e);
+                Ok(()) 
+            }
+        }
+    }
+}

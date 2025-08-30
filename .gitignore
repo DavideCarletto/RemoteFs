@@ -1,1 +1,44 @@
-/client/target
+# Rust
+/client/target/
+/client/Cargo.lock
+**/*.rs.bk
+temp_doc/
+
+# Node/TypeScript
+/server/node_modules/
+/server/dist/
+/server/.env
+/server/package-lock.json
+
+# Database files
+/server/data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Filesystem storage
+/server/fs/
+
+# Data directories
+/datatmp/
+
+# IDE files
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Log files
+*.log
+/server/logs/
+
+# Temporary files
+*.tmp
+*.temp
