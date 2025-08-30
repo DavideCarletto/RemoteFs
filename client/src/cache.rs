@@ -83,49 +83,43 @@ pub struct CacheConfig {
     pub directory_ttl: Duration,
     pub inode_path_ttl: Duration,
     pub file_content_ttl: Duration,
-    pub max_file_cache_size: usize, // Byte massimi per cache file
-    pub max_cached_files: usize,    // Numero massimo file in cache
+    pub max_file_cache_size: usize, 
+    pub max_cached_files: usize,
 }
 
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            metadata_ttl: Duration::from_secs(30),      // 30s per metadati
-            directory_ttl: Duration::from_secs(60),     // 1min per directory
-            inode_path_ttl: Duration::from_secs(300),   // 5min per mapping inode<->path
-            file_content_ttl: Duration::from_secs(120), // 2min per contenuto file
-            max_file_cache_size: 1024 * 1024,           // 1MB massimo per file
-            max_cached_files: 100,                      // Massimo 100 file
+            metadata_ttl: Duration::from_secs(30),       
+            directory_ttl: Duration::from_secs(60),     
+            inode_path_ttl: Duration::from_secs(300),   
+            file_content_ttl: Duration::from_secs(120), 
+            max_file_cache_size: 1024 * 1024,           
+            max_cached_files: 100,
         }
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum CacheInvalidationStrategy {
-    TTL,    // Time-to-Live
-    LRU,    // Least Recently Used
-    Hybrid, // TTL + LRU combination
+    TTL(Duration),    
+    LRU(usize),      
 }
 
 pub struct FileSystemCache {
-    // Cache metadati
     metadata_by_path: HashMap<String, CachedMetadata>,
     metadata_by_inode: HashMap<u64, CachedMetadata>,
 
-    // Cache mappature inode <-> path
     inode_to_path: HashMap<u64, (String, Instant)>,
     path_to_inode: HashMap<String, (u64, Instant)>,
 
-    // Cache directory
     directories: HashMap<String, CachedDirectory>,
 
-    // Cache contenuto file (per file piccoli)
     file_contents: HashMap<String, CachedFileContent>,
 
-    // Configurazione
     config: CacheConfig,
-    // strategy: CacheInvalidationStrategy,
+    strategy: CacheInvalidationStrategy,
 
-    // Statistiche
     pub stats: CacheStats,
 }
 
@@ -143,7 +137,7 @@ pub struct CacheStats {
 }
 
 impl FileSystemCache {
-    pub fn new(config: CacheConfig) -> Self {
+    pub fn new(config: CacheConfig, strategy: CacheInvalidationStrategy) -> Self {
         Self {
             metadata_by_path: HashMap::new(),
             metadata_by_inode: HashMap::new(),
@@ -152,23 +146,38 @@ impl FileSystemCache {
             directories: HashMap::new(),
             file_contents: HashMap::new(),
             config,
-            // strategy,
+            strategy,
             stats: Default::default(),
         }
     }
 
     pub fn with_default() -> Self {
-        Self::new(CacheConfig::default())
+        Self::new(CacheConfig::default(), CacheInvalidationStrategy::TTL(Duration::from_secs(60)))
+    }
+
+    /// Configura la strategia di invalidazione
+    pub fn set_strategy(&mut self, strategy: CacheInvalidationStrategy) {
+        debug!("Cache: changing strategy to {:?}", strategy);
+        self.strategy = strategy;
+        // Applica immediatamente la nuova strategia
+        self.apply_cache_strategy();
+    }
+
+    /// Verifica se un elemento è valido secondo la strategia corrente
+    fn is_valid_by_strategy(&self, cached_at: Instant) -> bool {
+        match &self.strategy {
+            CacheInvalidationStrategy::TTL(duration) => cached_at.elapsed() < *duration,
+            CacheInvalidationStrategy::LRU(_) => true, 
+        }
     }
 
     pub fn get_metadata_by_path(&mut self, path: &str) -> Option<FileMetadata> {
         if let Some(cached) = self.metadata_by_path.get(path) {
-            if cached.is_valid() {
+            if self.is_valid_by_strategy(cached.cached_at) {
                 self.stats.metadata_hits += 1;
                 debug!("Cache HIT: metadata per path {}", path);
                 return Some(cached.metadata.clone());
             } else {
-                // TTL scaduto, rimuovi
                 debug!("Cache EXPIRED: metadata per path {}", path);
                 self.metadata_by_path.remove(path);
             }
@@ -181,7 +190,7 @@ impl FileSystemCache {
 
     pub fn get_metadata_by_inode(&mut self, ino: u64) -> Option<FileMetadata> {
         if let Some(cached) = self.metadata_by_inode.get(&ino) {
-            if cached.is_valid() {
+            if self.is_valid_by_strategy(cached.cached_at) {
                 self.stats.metadata_hits += 1;
                 debug!("Cache HIT: metadata per inode {}", ino);
                 return Some(cached.metadata.clone());
@@ -197,6 +206,8 @@ impl FileSystemCache {
     }
 
     pub fn cache_metadata(&mut self, path: String, metadata: FileMetadata) {
+        self.apply_cache_strategy();
+        
         let cached = CachedMetadata::new(metadata.clone(), self.config.metadata_ttl);
 
         debug!(
@@ -252,7 +263,7 @@ impl FileSystemCache {
 
     pub fn get_directory_entries(&mut self, path: &str) -> Option<Vec<DirectoryEntry>> {
         if let Some(cached_dir) = self.directories.get(path) {
-            if cached_dir.is_valid() {
+            if self.is_valid_by_strategy(cached_dir.cached_at) {
                 self.stats.directory_hits += 1;
                 debug!(
                     "Cache HIT: directory {} ({} entries)",
@@ -277,6 +288,8 @@ impl FileSystemCache {
         path: String,
         entries: Vec<(String, u64, fuser::FileType)>,
     ) {
+        self.apply_cache_strategy();
+        
         let cached_entries: Vec<DirectoryEntry> = entries
             .into_iter()
             .map(|(name, ino, file_type)| DirectoryEntry {
@@ -297,6 +310,8 @@ impl FileSystemCache {
 
     #[cfg(target_os = "windows")]
     pub fn cache_directory_entries(&mut self, path: String, entries: Vec<(String, u64, String)>) {
+        self.apply_cache_strategy();
+        
         let cached_entries: Vec<DirectoryEntry> = entries
             .into_iter()
             .map(|(name, ino, file_type)| DirectoryEntry {
@@ -317,7 +332,7 @@ impl FileSystemCache {
 
     pub fn get_file_content(&mut self, path: &str, expected_size: u64) -> Option<Vec<u8>> {
         if let Some(cached_content) = self.file_contents.get(path) {
-            if cached_content.is_valid() && cached_content.file_size == expected_size {
+            if self.is_valid_by_strategy(cached_content.cached_at) && cached_content.file_size == expected_size {
                 self.stats.file_content_hits += 1;
                 debug!(
                     "Cache HIT: contenuto file {} ({} bytes)",
@@ -346,9 +361,7 @@ impl FileSystemCache {
             return false;
         }
 
-        if self.file_contents.len() >= self.config.max_cached_files {
-            self.evict_lru_file_content();
-        }
+        self.apply_cache_strategy();
 
         let cached_content = CachedFileContent::new(data, file_size, self.config.file_content_ttl);
         debug!(
@@ -392,19 +405,6 @@ impl FileSystemCache {
     }
 
 
-    fn evict_lru_file_content(&mut self) {
-        if let Some((oldest_path, _)) = self
-            .file_contents
-            .iter()
-            .min_by_key(|(_, content)| content.cached_at)
-            .map(|(path, content)| (path.clone(), content.cached_at))
-        {
-            debug!("Cache EVICT LRU: file content {}", oldest_path);
-            self.file_contents.remove(&oldest_path);
-        }
-    }
-
-
     pub fn cleanup_expired(&mut self) {
         let initial_count = self.metadata_by_path.len()
             + self.directories.len()
@@ -432,6 +432,38 @@ impl FileSystemCache {
         if initial_count > final_count {
             info!(
                 "Cache cleanup: rimossi {} elementi scaduti",
+                initial_count - final_count
+            );
+        }
+    }
+
+    fn cleanup_expired_with_ttl(&mut self, ttl: Duration) {
+        let initial_count = self.metadata_by_path.len()
+            + self.directories.len()
+            + self.file_contents.len()
+            + self.inode_to_path.len();
+
+        self.metadata_by_path.retain(|_, cached| cached.cached_at.elapsed() < ttl);
+        self.metadata_by_inode.retain(|_, cached| cached.cached_at.elapsed() < ttl);
+
+        self.directories.retain(|_, cached| cached.cached_at.elapsed() < ttl);
+
+        self.file_contents.retain(|_, cached| cached.cached_at.elapsed() < ttl);
+
+        self.inode_to_path
+            .retain(|_, (_, cached_at)| cached_at.elapsed() < ttl);
+        self.path_to_inode
+            .retain(|_, (_, cached_at)| cached_at.elapsed() < ttl);
+
+        let final_count = self.metadata_by_path.len()
+            + self.directories.len()
+            + self.file_contents.len()
+            + self.inode_to_path.len();
+
+        if initial_count > final_count {
+            info!(
+                "Cache cleanup (TTL {}s): rimossi {} elementi scaduti",
+                ttl.as_secs(),
                 initial_count - final_count
             );
         }
@@ -502,5 +534,89 @@ impl FileSystemCache {
         ));
 
         output
+    }
+
+    pub fn apply_cache_strategy(&mut self) {
+        match &self.strategy {
+            CacheInvalidationStrategy::TTL(duration) => {
+                self.cleanup_expired_with_ttl(*duration);
+            }
+            CacheInvalidationStrategy::LRU(max_entries) => {
+                let max = *max_entries;
+                while self.total_cached_items() > max {
+                    self.evict_oldest_item();
+                }
+            }
+        }
+    }
+
+    fn total_cached_items(&self) -> usize {
+        self.metadata_by_path.len() + 
+        self.directories.len() + 
+        self.file_contents.len() + 
+        self.inode_to_path.len()  
+    }
+
+    fn evict_oldest_item(&mut self) {
+        let mut oldest_time = Instant::now();
+        let mut oldest_type: Option<&str> = None;
+        let mut oldest_key = String::new();
+        let mut oldest_inode: Option<u64> = None;
+
+        for (path, cached) in &self.metadata_by_path {
+            if cached.cached_at < oldest_time {
+                oldest_time = cached.cached_at;
+                oldest_type = Some("metadata");
+                oldest_key = path.clone();
+            }
+        }
+
+        for (path, cached) in &self.directories {
+            if cached.cached_at < oldest_time {
+                oldest_time = cached.cached_at;
+                oldest_type = Some("directory");
+                oldest_key = path.clone();
+            }
+        }
+
+        for (path, cached) in &self.file_contents {
+            if cached.cached_at < oldest_time {
+                oldest_time = cached.cached_at;
+                oldest_type = Some("file_content");
+                oldest_key = path.clone();
+            }
+        }
+
+        for (ino, (path, cached_at)) in &self.inode_to_path {
+            if *cached_at < oldest_time {
+                oldest_time = *cached_at;
+                oldest_type = Some("inode_mapping");
+                oldest_key = path.clone();
+                oldest_inode = Some(*ino);
+            }
+        }
+
+        match oldest_type {
+            Some("metadata") => {
+                self.invalidate_path(&oldest_key);
+                debug!("LRU evict: metadata {}", oldest_key);
+            }
+            Some("directory") => {
+                self.directories.remove(&oldest_key);
+                debug!("LRU evict: directory {}", oldest_key);
+            }
+            Some("file_content") => {
+                self.file_contents.remove(&oldest_key);
+                debug!("LRU evict: file content {}", oldest_key);
+            }
+            Some("inode_mapping") => {
+                if let Some(ino) = oldest_inode {
+                    self.inode_to_path.remove(&ino);
+                    self.path_to_inode.remove(&oldest_key);
+                    debug!("LRU evict: inode mapping {} <-> {}", ino, oldest_key);
+                }
+            }
+            _ => {} 
+        }
     }
 }

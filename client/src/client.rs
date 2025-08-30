@@ -1,7 +1,5 @@
-use chrono::format::ParseErrorKind;
 use log::{debug, error, info, warn};
 use reqwest::blocking::Client;
-use serde::de;
 use std::time::Duration;
 
 use crate::cache::FileSystemCache;
@@ -99,7 +97,8 @@ impl RemoteFsClient {
                 }
             },
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => {
-                warn!("Inode {} non trovato sul server", ino);
+                warn!("Inode {} non trovato sul server - tentativo di debug", ino);
+                debug!("URL richiesta: {}", url);
                 None
             }
             Ok(resp) => {
@@ -128,15 +127,16 @@ impl RemoteFsClient {
     /// Richiede i metadati di un file al server (con cache)
     pub fn get_file_metadata(&mut self, path: &str) -> Option<FileMetadata> {
         let server_path = self.normalize_path_for_server(path);
-        let url = format!("{}/metadata?path={}", self.api_url, server_path);
 
-        //controllo prima la cache
         if let Some(cached_metadata) = self.cache.get_metadata_by_path(&server_path) {
             debug!("CACHE HIT: metadata per {}", server_path);
             return Some(cached_metadata);
         }
 
-        debug!("CACHE MISS: richiedendo metadata dal server per {}", server_path);
+        debug!(
+            "CACHE MISS: richiedendo metadata dal server per {}",
+            server_path
+        );
         let url = format!("{}/metadata?path={}", self.api_url, server_path);
 
         match self.http_client.get(&url).send() {
@@ -150,7 +150,8 @@ impl RemoteFsClient {
                                 server_path, metadata.ino
                             );
                             //salvo in cache per le prossime volte
-                            self.cache.cache_metadata(server_path.clone(), metadata.clone());
+                            self.cache
+                                .cache_metadata(server_path.clone(), metadata.clone());
                             debug!("Metadati memorizzati in cache per {}", server_path);
                             Some(metadata)
                         }
@@ -176,7 +177,7 @@ impl RemoteFsClient {
 
     /// Aggiorna gli attributi di un file
     pub fn update_file_metadata(
-        &self,
+        &mut self,
         path: &str,
         updates: serde_json::Value,
     ) -> Option<FileMetadata> {
@@ -190,19 +191,34 @@ impl RemoteFsClient {
         let url = format!("{}/metadata?path={}", self.api_url, server_path);
 
         match self.http_client.patch(&url).json(&updates).send() {
-            Ok(resp) if resp.status().is_success() => match resp.json::<FileMetadata>() {
-                Ok(metadata) => {
-                    info!(
-                        "Attributi aggiornati per {}: inode {}",
-                        server_path, metadata.ino
-                    );
-                    Some(metadata)
+            Ok(resp) if resp.status().is_success() => {
+                match resp.text() {
+                    Ok(text) => {
+                        debug!("Risposta server per {}: {}", server_path, text);
+                        match serde_json::from_str::<FileMetadata>(&text) {
+                            Ok(metadata) => {
+                                info!(
+                                    "Attributi aggiornati per {}: inode {}",
+                                    server_path, metadata.ino
+                                );
+                                
+                                self.cache.invalidate_path(&server_path);
+                                debug!("Cache invalidata per file aggiornato: {}", server_path);
+                                
+                                Some(metadata)
+                            }
+                            Err(e) => {
+                                error!("Errore parsing JSON per {}: {} - Response: {}", server_path, e, text);
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Errore lettura risposta per {}: {}", server_path, e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    error!("Errore parsing JSON per {}: {}", server_path, e);
-                    None
-                }
-            },
+            }
             Ok(resp) => {
                 error!("Errore server per {}: {}", server_path, resp.status());
                 None
@@ -234,8 +250,6 @@ impl RemoteFsClient {
                 Ok(metadata) => {
                     info!("{} creato (server-side): inode {}", file_type, metadata.ino);
 
-                    //invalidazione directory padre dopo creazione
-                    //estrai path dalla request_data
                     if let Some(path) = request_data.get("path").and_then(|v| v.as_str()) {
                         let server_path = self.normalize_path_for_server(path);
                         if let Some(parent_pos) = server_path.rfind('/') {
@@ -245,7 +259,10 @@ impl RemoteFsClient {
                                 &server_path[..parent_pos]
                             };
                             self.cache.invalidate_directory(parent_path);
-                            debug!("Cache directory padre invalidata dopo creazione: {}", parent_path);
+                            debug!(
+                                "Cache directory padre invalidata dopo creazione: {}",
+                                parent_path
+                            );
                         }
                     }
                     Ok(metadata)
@@ -309,17 +326,19 @@ impl RemoteFsClient {
             Ok(resp) => match resp.status() {
                 reqwest::StatusCode::OK => {
                     info!("Filesystem object rimosso: {}", server_path);
-                    //invalidazione cache dopo rimozione
-                    if is_directory{
+                    
+                    if is_directory {
                         self.cache.invalidate_directory(&server_path);
                         debug!("Cache directory invalidata per: {}", server_path);
-                    }else{
+                    } else {
                         self.cache.invalidate_path(&server_path);
                         debug!("Cache file invalidata per: {}", server_path);
                     }
+                    
+                    self.cache.invalidate_path(&server_path);
+                    debug!("Cache metadati invalidata per oggetto rimosso: {}", server_path);
 
-                    //invalida la directory padre (la lista è cambiata)
-                    if let Some(parent_pos) = server_path.rfind('/'){
+                    if let Some(parent_pos) = server_path.rfind('/') {
                         let parent_path = if parent_pos == 0 {
                             "/"
                         } else {
@@ -474,11 +493,7 @@ impl RemoteFsClient {
                         self.cache.get_file_content(&server_path, metadata.size)
                     {
                         let end = (read_size as usize).min(cached_data.len());
-                        debug!("Dati file trovati in cache per: {}", server_path);
-                        
-                        // 🟢 Log stats ogni tanto per vedere performance
-                        info!("📊 {}", self.cache.get_stats());
-                        
+
                         return Ok(cached_data[..end].to_vec());
                     }
                 }
@@ -571,9 +586,20 @@ impl RemoteFsClient {
                     result.len()
                 );
                 //salva contenuto file in cache (se leggibile completamente)
-                if offset == 0 && result.len() <= 1024*1024 && result.len() == metadata.size as usize {
-                    self.cache.cache_file_content(server_path.clone(), result.clone(), metadata.size);
-                    debug!("file content cached per {} ({} bytes)", server_path, result.len());
+                if offset == 0
+                    && result.len() <= 1024 * 1024
+                    && result.len() == metadata.size as usize
+                {
+                    self.cache.cache_file_content(
+                        server_path.clone(),
+                        result.clone(),
+                        metadata.size,
+                    );
+                    debug!(
+                        "file content cached per {} ({} bytes)",
+                        server_path,
+                        result.len()
+                    );
                 }
                 return Ok(result);
             }
@@ -581,25 +607,46 @@ impl RemoteFsClient {
         Err(libc::ENOENT)
     }
 
-    /// Lista il contenuto di una directory dal server (versione generica)
-    pub fn list_directory(&mut self, path: &str) -> Result<Vec<(String, u64, RemoteFsFileType)>, i32> {
+    pub fn list_directory(
+        &mut self,
+        path: &str,
+    ) -> Result<Vec<(String, u64, RemoteFsFileType)>, i32> {
         let server_path = self.normalize_path_for_server(path);
 
-        //controllo cache directory prima
-        if let Some(cached_entries) = self.cache.get_directory_entries(&server_path){
+        if let Some(cached_entries) = self.cache.get_directory_entries(&server_path) {
             debug!("CACHE HIT: directory entries per {}", server_path);
-            let result = cached_entries.into_iter().map(|entry|{
-                let file_type = match entry.file_type.as_str(){
-                    "Directory" => RemoteFsFileType::Directory,
-                    "RegularFile" => RemoteFsFileType::RegularFile,
-                    _ => RemoteFsFileType::RegularFile,
-                };
-                (entry.name, entry.ino, file_type)
-            }).collect();
+            let result = cached_entries
+                .into_iter()
+                .map(|entry| {
+                    let file_type = {
+                        #[cfg(target_os = "linux")]
+                        {
+                            match entry.file_type {
+                                fuser::FileType::Directory => RemoteFsFileType::Directory,
+                                fuser::FileType::RegularFile => RemoteFsFileType::RegularFile,
+                                _ => RemoteFsFileType::RegularFile,
+                            }
+                        }
+
+                        #[cfg(target_os = "windows")]
+                        {
+                            match entry.file_type.as_str() {
+                                "Directory" => RemoteFsFileType::Directory,
+                                "RegularFile" => RemoteFsFileType::RegularFile,
+                                _ => RemoteFsFileType::RegularFile,
+                            }
+                        }
+                    };
+                    (entry.name, entry.ino, file_type)
+                })
+                .collect();
             return Ok(result);
         }
 
-        debug!("CACHE MISS: richiedendo directory entries dal server per {}", server_path);
+        debug!(
+            "CACHE MISS: richiedendo directory entries dal server per {}",
+            server_path
+        );
 
         let response = self
             .http_client
@@ -633,21 +680,64 @@ impl RemoteFsClient {
                             &server_path,
                             result.len()
                         );
-                        //salvo directory entries nella cache
-                        let cache_entries = entries.iter()
+                        let cache_entries: Vec<_> = entries
+                            .iter()
                             .filter_map(|entry| {
-                                if let (Some(name),Some(ino),Some(file_type)) = (
+                                if let (Some(name), Some(ino), Some(file_type_str)) = (
                                     entry.get("name").and_then(|v| v.as_str()),
                                     entry.get("ino").and_then(|v| v.as_u64()),
                                     entry.get("file_type").and_then(|v| v.as_str()),
-                                ){
-                                    Some((name.to_string(), ino, file_type.to_string()))
+                                ) {
+                                    // mappa la stringa in RemoteFsFileType
+                                    #[cfg(target_os = "linux")]
+                                    let file_type = match file_type_str {
+                                        "Directory" => fuser::FileType::Directory,
+                                        "RegularFile" => fuser::FileType::RegularFile,
+                                        _ => fuser::FileType::RegularFile,
+                                    };
+
+                                    #[cfg(target_os = "windows")]
+                                    let file_type = match file_type_str {
+                                        "Directory" => RemoteFsFileType::Directory,
+                                        "RegularFile" => RemoteFsFileType::RegularFile,
+                                        _ => RemoteFsFileType::RegularFile,
+                                    };
+
+                                    Some((name.to_string(), ino, file_type))
                                 } else {
                                     None
                                 }
-                            }).collect();
+                            })
+                            .collect();
 
-                        self.cache.cache_directory_entries(server_path.clone(), cache_entries);
+                        #[cfg(target_os = "linux")]
+                        let cache_entries_for_cache: Vec<_> = cache_entries
+                            .iter()
+                            .map(|(name, ino, file_type)| {
+                                let ft_for_cache = match file_type {
+                                    fuser::FileType::Directory => fuser::FileType::Directory,
+                                    fuser::FileType::RegularFile => fuser::FileType::RegularFile,
+                                    _ => fuser::FileType::RegularFile,
+                                };
+                                (name.clone(), *ino, ft_for_cache)
+                            })
+                            .collect();
+
+                        #[cfg(target_os = "windows")]
+                        let cache_entries_for_cache: Vec<_> = cache_entries
+                            .iter()
+                            .map(|(name, ino, file_type)| {
+                                let ft_for_cache = match file_type {
+                                    RemoteFsFileType::Directory => "Directory".to_string(),
+                                    RemoteFsFileType::RegularFile => "RegularFile".to_string(),
+                                };
+                                (name.clone(), *ino, ft_for_cache)
+                            })
+                            .collect();
+
+                        self.cache
+                            .cache_directory_entries(server_path.clone(), cache_entries_for_cache);
+
                         debug!("Directory entries memorizzate in cache per {}", server_path);
                         Ok(result)
                     } else {
@@ -701,16 +791,12 @@ impl RemoteFsClient {
                     old_server_path, new_server_path
                 );
 
-                //invalidazione cache dopo rinomina
-                //invalida vecchio path
                 self.cache.invalidate_path(&old_server_path);
                 debug!("Invalidazione cache per vecchio path: {}", old_server_path);
 
-                //invalida nuovo path
                 self.cache.invalidate_path(&new_server_path);
                 debug!("Invalidazione cache per nuovo path: {}", new_server_path);
 
-                //invalida directory padre del vecchio path
                 if let Some(parent_pos) = old_server_path.rfind('/') {
                     let parent_path = if parent_pos == 0 {
                         "/"
@@ -721,9 +807,12 @@ impl RemoteFsClient {
                     debug!("Cache directory padre invalidata: {}", parent_path);
                 }
 
-                //invalida directory padre del nuovo path (se diversa)
                 if let Some(parent_pos) = new_server_path.rfind('/') {
-                    let parent_path = if parent_pos == 0 { "/" } else { &new_server_path[..parent_pos] };
+                    let parent_path = if parent_pos == 0 {
+                        "/"
+                    } else {
+                        &new_server_path[..parent_pos]
+                    };
                     self.cache.invalidate_directory(parent_path);
                     debug!("Cache directory padre invalidata: {}", parent_path);
                 }
@@ -860,8 +949,7 @@ impl RemoteFsClient {
             "Scrittura streaming completata: {} bytes scritti in {} chunks",
             total_written, total_chunks
         );
-        //invalidazione cache dopo scrittura
-        //file è stato modificato, quindi cache metadata e content sono stale
+
         self.cache.invalidate_path(&server_path);
         debug!("Invalidazione cache per file scritto: {}", server_path);
 
@@ -874,25 +962,27 @@ impl RemoteFsClient {
             path, file_handle
         );
 
-        // ✅ FIX: Ottieni metadati PRIMA della logica di skip
         let should_skip = {
             if let Some(metadata) = self.get_file_metadata(path) {
-                // Skip per directory
                 if metadata.file_type == crate::types::RemoteFsFileType::Directory {
                     debug!("Skip flush per directory: {}", path);
                     return Ok(());
                 }
-                
-                // Skip per file piccoli
+
                 if metadata.size < 4096 {
-                    debug!("Skip flush per file piccolo ({} bytes): {}", metadata.size, path);
+                    debug!(
+                        "Skip flush per file piccolo ({} bytes): {}",
+                        metadata.size, path
+                    );
                     return Ok(());
                 }
-                
-                false // Non saltare
+
+                false
             } else {
-                // Se non riusciamo a ottenere metadati, proviamo comunque il flush
-                debug!("Metadati non disponibili per {}, procedendo con flush", path);
+                debug!(
+                    "Metadati non disponibili per {}, procedendo con flush",
+                    path
+                );
                 false
             }
         };
@@ -907,8 +997,8 @@ impl RemoteFsClient {
             "filePath": normalized_path
         });
 
-        // ✅ Timeout più breve per flush
-        let response = self.http_client
+        let response = self
+            .http_client
             .patch(&format!("{}/flush", self.api_url))
             .timeout(std::time::Duration::from_secs(2))
             .json(&payload)
@@ -920,19 +1010,17 @@ impl RemoteFsClient {
                 Ok(())
             }
             Ok(resp) => {
-                debug!("Flush fallito per {} con status {}, ignorato", path, resp.status());
-                Ok(()) // Non bloccare per errori di flush
+                debug!(
+                    "Flush fallito per {} con status {}, ignorato",
+                    path,
+                    resp.status()
+                );
+                Ok(()) 
             }
             Err(e) => {
                 debug!("Flush fallito per {} con errore {}, ignorato", path, e);
-                Ok(()) // Non bloccare per errori di flush
+                Ok(()) 
             }
         }
     }
-
-   /// Stampa statistiche cache per debug
-    pub fn print_cache_stats(&self) {
-        println!("📊 CACHE STATISTICS:\n{}", self.cache.get_stats());
-    }
-
 }

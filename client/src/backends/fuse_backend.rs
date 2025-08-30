@@ -4,6 +4,7 @@ use fuser::Filesystem;
 use log::{debug, error, info, warn};
 use serde_json::json;
 use std::time::{Duration, SystemTime};
+use crate::CacheInvalidationStrategy;
 
 const MAX_NAME_LENGTH: u32 = 255;
 
@@ -14,10 +15,11 @@ pub struct FuseRemoteFs {
 #[cfg(target_os = "linux")]
 impl FuseRemoteFs {
     /// Crea una nuova istanza del filesystem FUSE
-    pub fn new(api_url: String) -> Self {
+    pub fn new(api_url: String, cache_inv_strategy: CacheInvalidationStrategy) -> Self {
         debug!("Inizializzazione FuseRemoteFs per API: {}", api_url);
 
-        let client = RemoteFsClient::new(api_url);
+        let mut client = RemoteFsClient::new(api_url);
+        client.cache_mut().set_strategy(cache_inv_strategy);
 
         Self { client }
     }
@@ -28,6 +30,10 @@ impl FuseRemoteFs {
 
     pub fn client_mut(&mut self) -> &mut RemoteFsClient {
         &mut self.client
+    }
+
+    pub fn get_cache_stats(&self) -> String {
+        self.client.cache().get_stats()
     }
 }
 
@@ -43,7 +49,6 @@ impl Filesystem for FuseRemoteFs {
                 config.set_max_readahead(1024 * 1024).ok();
                 config.set_max_write(1024 * 1024).ok();
 
-                info!("Client del filesystem remoto inizializzato con successo.");
                 Ok(())
             }
             Err(e) => {
@@ -53,13 +58,9 @@ impl Filesystem for FuseRemoteFs {
         }
     }
     fn destroy(&mut self) {
-        debug!("Cache stats: {:?}", self.client.cache().get_stats());
+        info!("{}", self.client.cache().get_stats());
 
         info!("Filesystem remoto smontato e distrutto");
-        // Puoi aggiungere cleanup qui se necessario:
-        // - Chiudere connessioni HTTP persistenti
-        // - Salvare cache o stato
-        // - Log di chiusura
     }
 
     fn lookup(
@@ -171,10 +172,13 @@ impl Filesystem for FuseRemoteFs {
         let path = match self.client.inode_to_path(ino) {
             Some(p) => p,
             None => {
+                error!("Impossibile risolvere inode {} in path per setattr", ino);
                 reply.error(libc::ENOENT);
                 return;
             }
         };
+
+        debug!("setattr per path: {}", path);
 
         let current_time = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -201,13 +205,24 @@ impl Filesystem for FuseRemoteFs {
             None => None,
         };
 
-        let mut updates = serde_json::json!({
-            "mode": mode,
-            "uid": uid,
-            "gid": gid,
-            "size": size,
-            "flags": flags,
-        });
+        let mut updates = serde_json::json!({});
+
+        if let Some(m) = mode {
+            let permissions_only = m & 0o7777;
+            updates["mode"] = json!(permissions_only);
+        }
+        if let Some(u) = uid {
+            updates["uid"] = json!(u);
+        }
+        if let Some(g) = gid {
+            updates["gid"] = json!(g);
+        }
+        if let Some(s) = size {
+            updates["size"] = json!(s);
+        }
+        if let Some(f) = flags {
+            updates["flags"] = json!(f);
+        }
 
         if let Some(atime) = atime_secs {
             updates
@@ -229,7 +244,7 @@ impl Filesystem for FuseRemoteFs {
             Some(metadata) => {
                 let file_attr = metadata.to_file_attr();
                 info!("Attributi aggiornati per {}: {:?}", path, file_attr);
-                reply.attr(&std::time::Duration::from_secs(1), &file_attr);
+                reply.attr(&std::time::Duration::from_secs(0), &file_attr);
             }
             None => {
                 debug!("Impossibile aggiornare attributi per {}: {}", path, updates);
@@ -753,7 +768,6 @@ impl Filesystem for FuseRemoteFs {
             }
         };
 
-        // Prima verifica che la directory esista
         match self.client.get_file_metadata(&path) {
             Some(metadata)
                 if fuser::FileType::from(metadata.file_type.clone())
@@ -946,7 +960,6 @@ impl Filesystem for FuseRemoteFs {
             .unwrap_or(Duration::from_secs(0))
             .as_secs();
 
-        // Costruisci request_data come JSON flessibile
         let attrs = json!({
             "path": full_path,
             "file_type": file_type,

@@ -5,91 +5,156 @@
 Remote Filesystem è un client filesystem remoto scritto in Rust, capace di montare via FUSE (Linux/WSL) o WinFSP (Windows nativo) la struttura di un server remoto accessibile tramite REST API.
 Il sistema è multipiattaforma, e ogni backend (FUSE/WinFSP) espone le classiche operazioni da shell/Explorer sul mountpoint virtuale: navigazione, lettura/scrittura, gestione permessi, creazione/renomina/rimozione, con cache per performance ottimali.
 
-***
+## 🏗️ Architettura
 
-## 🐧 Modalità 1 – Linux/WSL (FUSE)
+- **Server**: Node.js con TypeScript, containerizzato con Docker
+- **Client**: Rust nativo che gira sul sistema operativo host in modalità daemon
+- **Storage**: SQLite per i metadati, volume Docker per la persistenza
+- **Script di controllo**: PowerShell (Windows) e Bash (Linux) per gestione automatica
+
+## 🐧 Setup Linux/WSL (FUSE)
 
 ### 📋 Requisiti
 
-- **Sistema:** Linux nativo o WSL (Windows Subsystem for Linux, preferibilmente Ubuntu)
+- **Sistema:** Linux nativo o WSL
 - **Software:**
     - Rust (toolchain con cargo)
-    - Node.js e npm
     - FUSE3 (`fuse3`, `libfuse3-dev`, `pkg-config`)
-- **Permessi:** Accesso ad una shell con privilegi per mount FUSE
-
 
 ### 🛠️ Installazione
 
 ```bash
 # 1. Installa i prerequisiti
 sudo apt update
-sudo apt install fuse3 libfuse3-dev nodejs npm pkg-config
+sudo apt install fuse3 libfuse3-dev pkg-config
 
 # 2. Installa Rust
 curl https://sh.rustup.rs -sSf | sh
 
-# 3. Clona il repository
-git clone https://github.com/DavideCarletto/RemoteFs.git
-cd RemoteFs
-
-# 4. Rendi FUSE utilizzabile dagli utenti
+# 3. Rendi FUSE utilizzabile dagli utenti
 sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf
 ```
 
+### 🚀 Avvio del Server
 
-### 🚀 Avvio
-
+#### Script di controllo
 ```bash
-# Terminale 1: Avvia il server REST
+cd scripts/linux
+
+# Mostra help
+./run-server.sh help
+
+# Installa dipendenze
+./run-server.sh install
+
+# Avvia server
+./run-server.sh start
+
+# Controlla status
+./run-server.sh status
+
+# Mostra log
+./run-server.sh logs 20
+
+# Ferma server
+./run-server.sh stop
+
+# Riavvia server
+./run-server.sh restart
+```
+
+#### Manuale
+```bash
 cd server
 npm install
-npm start
-# Ora il server è su http://localhost:3000
+npm run build    # Compila TypeScript
+npm start        # Avvia server
 
-# Terminale 2: Avvia il client FUSE
-cd client
-cargo run
-# Modalità daemon (background)
-cargo run -- --daemon
-# Mountpoint personalizzato
-cargo run -- --mount-point /tmp/my-remote-fs
 ```
 
-Il filesystem sarà montato in `/tmp/remote-fs` di default (modificabile).
+### 🚀 Avvio del Client
 
-***
+#### Script di controllo
+```bash
+cd scripts/linux
 
-### 🧑‍💻 Comandi da Linux/WSL nel Mountpoint (esempi pratici)
+# Mostra help
+./remote-fs-ctl.sh help
 
-> Da qualsiasi shell dentro la dir montata (es. cd /tmp/remote-fs):
+# Avvia daemon (modalità background)
+./remote-fs-ctl.sh start
+
+# Controlla status
+./remote-fs-ctl.sh status
+
+# Mostra log
+./remote-fs-ctl.sh logs 30
+
+# Esegui test
+./remote-fs-ctl.sh test
+
+# Ferma daemon
+./remote-fs-ctl.sh stop
+
+# Riavvia daemon
+./remote-fs-ctl.sh restart
+```
+
+#### Manuale con opzioni avanzate
+```bash
+cd client
+
+# Modalità daemon (default)
+cargo run --release
+
+# Modalità foreground (debug)
+cargo run --release -- --foreground
+
+# Mountpoint personalizzato
+cargo run --release -- --mount-point /tmp/my-remote-fs
+
+# Server personalizzato
+cargo run --release -- --api-url http://custom-server:3000
+
+# Invalidazione cache personalizzata (secondi)
+cargo run --release -- --cache-inv 60
+
+# Combinazione opzioni
+cargo run --release -- --foreground --mount-point /tmp/test --cache-inv 30
+```
+
+Il filesystem sarà montato in `/tmp/remote-fs` di default.
+
+### 🧑‍💻 Comandi Linux/WSL nel Mountpoint
 
 ```bash
-ls                        # Elenca il contenuto della directory attuale
-ls -la                    # Elenco dettagliato (permessi, inode, tipo)
-pwd                       # Mostra il path corrente
-cd newdir                 # Entra in una directory
-cd ..                     # Torna indietro
-cat file.txt              # Legge il contenuto di un file (streaming)
-stat file.txt             # Mostra metadati avanzati
-file file.txt             # Mostra tipo file
-head file.txt             # Prime 10 righe
-tail file.txt             # Ultime 10 righe
-touch nuovo.txt           # Crea un nuovo file vuoto
-echo "ciao" > nuovo.txt   # Scrive in un file (streaming)
-cp file.txt copia.txt     # Copia file (streaming)
-mv file.txt nuovo.txt     # Rinomina o sposta file
-mkdir nuova_dir           # Crea una directory
-rm file.txt               # Elimina un file
-rmdir nuova_dir           # Elimina directory vuota
-chmod 755 file.txt        # Modifica permessi
-```
+# Navigazione base
+ls /tmp/remote-fs                    # Elenca contenuto
+ls -la /tmp/remote-fs               # Elenco dettagliato
+cd /tmp/remote-fs                   # Entra nel mountpoint
+pwd                                 # Path corrente
 
-> Le stesse azioni possono essere automatizzate via script bash/copia.
+# Operazioni file
+echo "test content" > file.txt      # Crea e scrive file
+cat file.txt                        # Legge contenuto
+cp file.txt backup.txt              # Copia file
+mv file.txt renamed.txt             # Rinomina file
+rm backup.txt                       # Elimina file
+
+# Operazioni directory
+mkdir test_dir                      # Crea directory
+ls test_dir                         # Lista directory
+rmdir test_dir                      # Rimuove directory vuota
+
+# Metadati e attributi
+stat file.txt                       # Mostra metadati
+file file.txt                       # Tipo file
+du -h file.txt                      # Dimensione file
+```
 
 ***
 
-## 🪟 Modalità 2 – Windows nativo (WinFSP)
+## 🪟 Setup Windows (WinFSP)
 
 ### 📋 Requisiti
 
@@ -98,9 +163,8 @@ chmod 755 file.txt        # Modifica permessi
     - Rust (toolchain con cargo)
     - Node.js e npm
     - WinFSP ([choco install winfsp -y] oppure installer ufficiale)
-    - Chocolatey (gestore pacchetti, opzionale ma consigliato)
-- **Permessi:** Privilegi amministrativi per la configurazione driver/DLL
-
+    - Docker Desktop (per il server)
+- **Permessi:** Privilegi amministrativi per la configurazione driver
 
 ### 🛠️ Installazione WinFSP
 
@@ -113,83 +177,254 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocola
 # Installa WinFSP
 choco install winfsp -y
 
-# Eventualmente aggiorna
-choco upgrade winfsp -y
-
-# Dopo l’installazione:
-# - Assicurati che winfsp-x64.dll sia in C:\Program Files\WinFsp\bin\
-# - Se necessario, copia winfsp-x64.dll nella cartella dell’eseguibile Rust (target\debug o target\release):
-copy "C:\Program Files\WinFsp\bin\winfsp-x64.dll" .\target\debug\
-# - Aggiungi C:\Program Files\WinFsp\bin\ al PATH (se non già)
+# Verifica installazione
+Get-ChildItem "C:\Program Files (x86)\WinFsp" -ErrorAction SilentlyContinue
 ```
 
+> **💡 Gestione automatica DLL**: Lo script `remote-fs-ctl.ps1` copia automaticamente `winfsp-x64.dll` nella directory `target/release` durante l'avvio del daemon. Non è necessaria configurazione manuale.
 
-### 🚀 Avvio
+### 📋 Gestione manuale DLL (opzionale)
+
+Se necessario, puoi copiare manualmente la DLL WinFSP:
 
 ```powershell
-# Terminale 1 (PowerShell): Avvia il server Node.js in WSL o Docker
+# Copia la DLL WinFSP nel target di build
+Copy-Item "C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll" ".\client\target\release\"
+
+# Verifica che la DLL sia presente
+Test-Path ".\client\target\release\winfsp-x64.dll"
+Get-ChildItem "C:\Program Files\WinFsp\bin\"
+```
+
+### 🚀 Avvio del Server
+
+#### Opzione A: Script PowerShell nativo (con Dokcker)
+```powershell
+# Vai nella directory degli script Windows
+cd scripts\windows
+
+# Mostra help
+.\run-server.ps1 help
+
+# Builda l'immagine Docker (prima volta)
+.\run-server.ps1 build
+
+# Avvia server
+.\run-server.ps1 start
+
+# Controlla status
+.\run-server.ps1 status
+
+# Mostra log
+.\run-server.ps1 logs
+
+# Ferma server
+.\run-server.ps1 stop
+
+# Riavvia server
+.\run-server.ps1 restart
+```
+
+#### Opzione B: manuale con Docker
+```powershell
+# Avvia server Docker 
+docker run -d --name remotefs-server -p 3000:3000 remotefs-server 
+
+# Verifica
+Invoke-RestMethod http://localhost:3000/health
+```
+#### Opzione C: Script di controllo via WSL
+```powershell
+# Avvia WSL e usa gli script Linux
 wsl
-cd ~/RemoteFs/server   # o percorso equivalente
+cd /mnt/c/Users/Davide/Projects/RustProjects/remote_fs/scripts/linux
+
+# Mostra help
+./run-server.sh help
+
+# Installa dipendenze (prima volta)
+./run-server.sh install
+
+# Avvia server
+./run-server.sh start
+
+# Controlla status
+./run-server.sh status
+
+# Mostra log
+./run-server.sh logs 20
+
+# Ferma server
+./run-server.sh stop
+
+# Riavvia server
+./run-server.sh restart
+```
+
+#### Opzione D: Manuale via WSL
+```powershell
+# Avvia WSL
+wsl
+cd /mnt/c/Users/Davide/Projects/RustProjects/remote_fs/server
+
+# Installa dipendenze
 npm install
+
+# Compila TypeScript
+npm run build
+
+# Avvia server
 npm start
 
-# Terminale 2 (PowerShell admin): Avvia il client Rust WinFSP
-cd .\RemoteFs\client
-cargo run
-# Il filesystem remount sarà visibile come un nuovo drive es: R:\
+# Oppure modalità sviluppo
+npm run start:dev
 ```
 
+### 🚀 Avvio del Client
 
-***
+#### Script di controllo (Raccomandato)
+```powershell
+cd scripts\windows
 
-### 🧑‍💻 Comandi su Mountpoint Windows (esempi pratici, PowerShell/CMD)
+# Mostra help
+.\remote-fs-ctl.ps1 help
 
-> All’interno del nuovo drive virtuale (`R:\`), tramite PowerShell, CMD e Explorer:
+# Avvia daemon (modalità background)
+.\remote-fs-ctl.ps1 start
+
+# Controlla status
+.\remote-fs-ctl.ps1 status
+
+# Apre nuova finestra PowerShell con accesso al drive R:
+.\remote-fs-ctl.ps1 shell
+
+# Mostra log
+.\remote-fs-ctl.ps1 logs
+
+# Esegui test completi
+.\remote-fs-ctl.ps1 test
+
+# Ferma daemon
+.\remote-fs-ctl.ps1 stop
+
+# Riavvia daemon
+.\remote-fs-ctl.ps1 restart
+```
+
+#### Manuale con opzioni avanzate
+```powershell
+cd client
+
+# Modalità daemon (default)
+cargo run --release
+
+# Modalità foreground (debug)
+cargo run --release -- --foreground
+
+# Drive personalizzato
+cargo run --release -- --mount-point S:
+
+# Server personalizzato
+cargo run --release -- --api-url http://custom-server:3000
+
+# Invalidazione cache personalizzata (secondi)
+cargo run --release -- --cache-inv 120
+
+# Combinazione opzioni
+cargo run --release -- --foreground --mount-point T: --cache-inv 60
+```
+
+Il filesystem sarà montato come drive `R:` di default.
+
+### 🧑‍💻 Comandi Windows nel Mountpoint
 
 ```powershell
-# Navigazione e informazione
-ls                           # Elenca contenuto directory
-ls -la                       # Elenco dettagliato (solo PowerShell 7+)
-pwd                          # Mostra percorso corrente
-cd nuova_dir                 # Cambia directory
-cd ..                        # Torna alla directory precedente
-# Lettura e scrittura file
-type file.txt                # Leggi contenuto file (cmd)
-Get-Content file.txt         # Leggi contenuto file (PowerShell)
-stat file.txt                # Mostra informazioni base (Get-Item file.txt | Format-List *)
-head -n 10 file.txt          # Prime righe (Get-Content file.txt -TotalCount 10)
-tail -n 10 file.txt          # Ultime righe (Get-Content file.txt | Select-Object -Last 10)
-New-Item nuovo.txt -ItemType File  # Crea nuovo file vuoto
-echo "ciao" > nuovo.txt      # Scrive in un file (streaming)
-cp file.txt copia.txt        # Copia file (PowerShell/CMD)
-mv file.txt nuovo.txt        # Rinomina o sposta file (PowerShell/CMD)
-New-Item nuova_dir -ItemType Directory # Crea directory
-del file.txt                 # Elimina file (CMD)
-Remove-Item file.txt         # Elimina file (PowerShell)
-Remove-Item nuova_dir        # Elimina directory vuota (PowerShell)
-Rename-Item file.txt nuovo.txt # Rinomina file
-# Modifica permessi (parziale)
-# NB: L’attributo sola lettura si può modificare con:
-Set-ItemProperty -Path file.txt -Name IsReadOnly -Value $true
+# Navigazione base
+Get-ChildItem R:\                           # Elenca contenuto
+Get-ChildItem R:\ -Force                    # Include file nascosti
+Set-Location R:\                            # Entra nel drive
+Get-Location                                # Path corrente
+
+# Operazioni file
+Set-Content R:\file.txt "test content"      # Crea e scrive file
+Get-Content R:\file.txt                     # Legge contenuto
+Copy-Item R:\file.txt R:\backup.txt         # Copia file
+Rename-Item R:\file.txt R:\renamed.txt      # Rinomina file
+Remove-Item R:\backup.txt                   # Elimina file
+
+# Operazioni directory
+New-Item R:\test_dir -ItemType Directory    # Crea directory
+Get-ChildItem R:\test_dir                   # Lista directory
+Remove-Item R:\test_dir                     # Rimuove directory vuota
+
+# Metadati e attributi
+Get-Item R:\file.txt | Format-List *        # Mostra metadati
+Get-Item R:\file.txt | Select Name,Length   # Info specifiche
 ```
 
-> Anche tramite Esplora Risorse è possibile navigare, copiare, rinominare, eliminare file e directory, oltre che vedere le dimensioni e le date.
+### 🗒️ Differenze & Note Implementative
 
-***
-
-### 🗒️ Differenze \& Note Implementative
-
-- **Permessi:** Su Linux/WSL i permessi UNIX sono pienamente supportati. Su Windows le operazioni di chmod sono emulate dove possibile (attributi sola lettura/sistema), ma non c’è corrispondenza 1:1 con i permessi POSIX.
+- **Permessi:** Su Linux/WSL i permessi UNIX sono pienamente supportati. Su Windows le operazioni di chmod sono emulate dove possibile.
+- **Drive Letters:** Windows usa drive letter (R:, S:, etc.), Linux usa mount points (/tmp/remote-fs).
 - **Symlink/Hardlink:** Non supportati da nessuna delle due versioni.
-- **Streaming:** Entrambe le versioni supportano la lettura/scrittura di file grandi via REST chunked.
-- **Cache:** Sia FUSE che WinFSP usano cache per metadati e contenuti.
+- **Cache:** Entrambe le versioni usano cache per metadati e contenuti.
 
 ***
 
-## 🖥️ Logging \& Debug
+## 🧪 Testing
 
-- Modalità console: log colorati con timestamp, modulo e livello.
-- Modalità daemon: file `/tmp/remote-fs-client.log` (Linux) o file log in cartella temp (Windows).
+### Test Automatici
+
+#### Linux
+```bash
+cd scripts/linux
+./remote-fs-ctl.sh test    # Esegue test completi FUSE
+```
+
+#### Windows
+```powershell
+cd scripts\windows
+.\remote-fs-ctl.ps1 test   # Esegue test completi WinFSP
+```
+
+### Test Manuali
+
+I test coprono tutte le operazioni filesystem:
+- ✅ **Prerequisites** - Verifica ambiente
+- ✅ **Mkdir** - Creazione directory
+- ✅ **Readdir** - Lettura directory
+- ✅ **Create** - Creazione file
+- ✅ **Read/Write** - Lettura/scrittura file
+- ✅ **Attributes** - Gestione attributi
+- ✅ **Rename** - Rinomina/spostamento
+- ✅ **Unlink/Rmdir** - Eliminazione
+- ✅ **Statfs** - Statistiche filesystem
+- ✅ **Lookup** - Ricerca file
+- ✅ **Concurrent** - Operazioni concorrenti
+- ✅ **Performance** - Test performance
+
+***
+
+## 🖥️ Logging & Debug
+
+### Modalità Foreground
+- Log colorati in console con timestamp, modulo e livello
+- Ideale per sviluppo e debug
+
+### Modalità Daemon
+- **Linux**: `/tmp/remote-fs-client.log`
+- **Windows**: `%TEMP%\remote-fs-client.log`
+
+### Visualizzazione Log
+```bash
+# Linux
+./remote-fs-ctl.sh logs 50      # Ultimi 50 log
+tail -f /tmp/remote-fs-client.log
+
+# Windows
+.\remote-fs-ctl.ps1 logs        # Ultimi log
+Get-Content $env:TEMP\remote-fs-client.log -Wait
+```
 
 ***
 
@@ -212,114 +447,104 @@ Il server espone i seguenti endpoint:
 | `/metadata?path=<path>`      | GET     | Ottiene metadati di un file           | ✅ |
 | `/metadata?path=<path>`      | PATCH   | Aggiorna metadati di un file          | ✅ |
 
----
+### Esempio API Usage
+```bash
+# Health check
+curl http://localhost:3000/health
 
-### ⚙️ Compatibilità
-- **Node.js / TypeScript**  
-- **SQLite** per metadati e storage fisico file  
+# Lista directory
+curl "http://localhost:3000/list?path=/"
+
+# Leggi file
+curl "http://localhost:3000/files?path=/file.txt"
+
+# Crea file
+curl -X POST "http://localhost:3000/files" \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/new.txt", "content": "Hello World"}'
+```
 
 ***
 
-## 🏗️ Architettura
+## 🏗️ Architettura Aggiornata
 
 ```
 ┌─────────────────┐    HTTP     ┌─────────────────┐
-│   FUSE Client   │ ◄────────► │   REST Server   │
-│     (Rust)      │   API       │ (Node.js/TS)    │
-│   + Cache LRU   │             │   + Streaming   │
+│ FUSE/WinFSP     │ ◄────────►  │    REST Server  │
+│ Client (Rust)   │   API       │ (Node.js/TS)    │
+│ + Daemon Mode   │             │   + Docker      │
+│ + Cache         │             │   + Streaming   │
+│ + Control Script│             │   + Health API  │
 └─────────────────┘             └─────────────────┘
          │                               │
-         │ FUSE / WinFSP                │ SQLite DB + File Storage
+         │ FUSE / WinFSP                 │ SQLite DB + File Storage
          ▼                               ▼
 ┌─────────────────┐             ┌─────────────────┐
 │  Mount Point    │             │ fs_nodes (meta) │
 │ /tmp/remote-fs  │             │ + fs/ (files)   │
-│ R:\             │             └─────────────────┘
-└─────────────────┘
+│ R:\ (Windows)   │             │ + Docker Volume │
+└─────────────────┘             └─────────────────┘
+
+Control Scripts:
+├── scripts/linux/remote-fs-ctl.sh    (Client Linux)
+├── scripts/linux/run-server.sh       (Server Linux)
+└── scripts/windows/remote-fs-ctl.ps1 (Client Windows)
 ```
 
+***
+
+## 📝 Opzioni Complete del Client
+
+### Opzioni Generali
+```bash
+# Linux/Windows
+--foreground              # Modalità foreground (default: daemon)
+--mount-point <PATH>      # Mountpoint personalizzato
+--api-url <URL>          # URL server (default: http://localhost:3000)
+--cache-inv <SECONDS>    # Secondi invalidazione cache (default: 30)
+--help                   # Mostra help
+
+# Esempi
+cargo run -- --foreground --mount-point /custom/path --cache-inv 60
+cargo run -- --api-url http://remote-server:8080 --foreground
+```
+
+### Opzioni Specifiche Linux
+```bash
+--mount-point /path/to/mount    # Default: /tmp/remote-fs
+```
+
+### Opzioni Specifiche Windows
+```bash
+--mount-point X:               # Default: R:
+```
 
 ***
 
 ## 🚨 Avvertimenti Importanti
 
-- Su Windows il server Node.js **va avviato sempre da WSL** per garantire compatibilità.
-- Il mountpoint viene smontato automaticamente alla chiusura del client.
-- Per unmount manuale su Linux:
+- **Server**: Assicurati che il server sia attivo prima di avviare il client
+- **Permessi Windows**: Potrebbero essere necessari privilegi amministrativi
+- **WSL**: Per il server Node.js su Windows, usa WSL per migliore compatibilità
+- **Unmount**: Il mountpoint viene smontato automaticamente alla chiusura del client
 
+### Unmount Manuale
+
+#### Linux
 ```bash
 fusermount -u /tmp/remote-fs
 # oppure
 sudo umount /tmp/remote-fs
 ```
 
+#### Windows
+```powershell
+# Normalmente automatico, ma se necessario:
+.\remote-fs-ctl.ps1 stop
+# oppure
+taskkill /f /im remote_fs.exe
+```
 
 ***
 
-### 🔧 **Possibili Estensioni Future**
-
-#### **1. Supporto MacOs**
-- **⚪ macOS Support**: Integrazione con macFUSE per supporto macOS nativo
-  ```bash
-  # Target: Supporto macOS con macFUSE
-  brew install macfuse
-  cargo build --target x86_64-apple-darwin
-  ```
-
-#### **2. Sicurezza e Produzione**
-- **🔒 HTTPS/TLS Support**: Comunicazione sicura client-server
-  ```typescript
-  // Server con certificati SSL/TLS
-  const https = require('https');
-  const fs = require('fs');
-  
-  const options = {
-    key: fs.readFileSync('private-key.pem'),
-    cert: fs.readFileSync('certificate.pem')
-  };
-  
-  https.createServer(options, app).listen(443);
-  ```
-
-#### **3. Containerizzazione e Deployment**
-- **🐳 Docker Support**: Containerizzazione completa del sistema
-  ```dockerfile
-  # Dockerfile per server
-  FROM node:18-alpine
-  WORKDIR /app
-  COPY package*.json ./
-  RUN npm ci --only=production
-  COPY . .
-  EXPOSE 3000
-  CMD ["npm", "start"]
-  ```
-  ```dockerfile
-  # Dockerfile per client (con FUSE support)
-  FROM rust:1.70-slim
-  RUN apt-get update && apt-get install -y fuse libfuse-dev
-  WORKDIR /app
-  COPY . .
-  RUN cargo build --release
-  CMD ["./target/release/remote-fs"]
-  ```
-- **🎛️ Docker Compose**: Orchestrazione multi-container
-  ```yaml
-  version: '3.8'
-  services:
-    remote-fs-server:
-      build: ./server
-      ports:
-        - "3000:3000"
-      volumes:
-        - ./data:/app/data
-    
-    remote-fs-client:
-      build: ./client
-      privileged: true  # Required for FUSE
-      devices:
-        - /dev/fuse
-      volumes:
-        - /tmp/remote-fs:/mnt/remote-fs:shared
-  ```
-
-**Sviluppatori:** Davide Carletto & Michele Carena  
+**Sviluppatori:** Davide Carletto & Michele Carena

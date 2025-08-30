@@ -8,6 +8,7 @@ temp_doc/
 /server/node_modules/
 /server/dist/
 /server/.env
+/server/package-lock.json
 
 # Database files
 /server/data/
@@ -18,5 +19,26 @@ temp_doc/
 # Filesystem storage
 /server/fs/
 
-#datatmp
+# Data directories
 /datatmp/
+
+# IDE files
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Log files
+*.log
+/server/logs/
+
+# Temporary files
+*.tmp
+*.temp

@@ -1,7 +1,8 @@
 #[cfg(target_os = "linux")]
 use fuser::{FileAttr, FileType};
-use serde::Deserialize;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, SystemTime};
+use serde::Deserialize;
 
 #[cfg(target_os = "windows")]
 use winfsp_wrs::{FileAttributes, FileInfo};
@@ -74,14 +75,9 @@ impl FileMetadata {
         info.set_file_attributes(attributes);
 
         fn to_filetime(secs: u64) -> u64 {
-            // Se il valore è già un FILETIME (> 10^16), restituiscilo così com'è
             if secs > 1_000_000_000_000_000_000 {
                 return secs;
             }
-            
-            // Altrimenti converti da Unix timestamp a FILETIME
-            // FILETIME = (UnixTime + 11644473600) * 10^7
-            // Controllo overflow prima della moltiplicazione
             let base_time = secs.saturating_add(11644473600);
             base_time.saturating_mul(10_000_000)
         }

@@ -53,36 +53,22 @@ app.get('/list', (req, res) => {
   }
 });
 
-// Read file content endpoint
 app.get('/files', (req, res) => {
   const path = req.query.path as string;
-  //const file_handle = req.query.file_handle as string;
   const offset = parseInt(req.query.offset as string) || 0;
   const size = parseInt(req.query.size as string) || 0;
-  //const chunk_index = parseInt(req.query.chunk_index as string) || 0;
 
 
   if (!path) {
     return res.status(400).json({ error: "Path parameter is required" });
   }
-  /*if (!path || !file_handle) {
-    return res.status(400).json({ error: 'Path and file handle are required' });
-  }*/
-
   try {
     const metadata = sqliteBackend.getFileMetadataByPath(path);
     if (!metadata) {
       return res.status(404).json({ error: 'File not found' });
     }
-
-    /*if (metadata.file_type !== 'RegularFile') {
-      return res.status(400).json({ error: 'Cannot read directory or special file' });
-    }*/
-
     const startOffset = Math.max(0, offset);
-    //const requestedSize = size || (metadata.size - startOffset);
     const requestedSize = Math.min(size, 1024*1024); //max 1MB per request
-    // Calcola la dimensione effettiva da leggere (non può essere più grande del file)
     const actualEndOffset = Math.min(startOffset + requestedSize - 1, metadata.size - 1);
     const actualSize = Math.max(0, actualEndOffset - startOffset + 1);
 
@@ -176,7 +162,6 @@ app.put('/files', (req, res) => {
 
     req.on('data', (chunk: Buffer) => {
       totalBytesWritten += chunk.length;
-      // Log dei primi 16 byte di ogni chunk ricevuto dal server
       const preview = chunk.subarray(0, 16);
       const hexPreview = Array.from(preview).map(b => b.toString(16).padStart(2, '0')).join(' ');
     });
@@ -255,7 +240,39 @@ app.post("/mkdir", (req, res) => {
     }
 
     const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
-    const parentIno = sqliteBackend.getInodeByPath(parentPath);
+    let parentIno = sqliteBackend.getInodeByPath(parentPath);
+    
+    if (!parentIno && parentPath !== '/') {
+      
+      const pathParts = parentPath.split('/').filter((part: string) => part.length > 0);
+      let currentPath = '';
+      
+      for (const part of pathParts) {
+        currentPath += '/' + part;
+        let currentIno = sqliteBackend.getInodeByPath(currentPath);
+        
+        if (!currentIno) {
+          const currentParentPath = currentPath.substring(0, currentPath.lastIndexOf('/')) || '/';
+          const currentParentIno = sqliteBackend.getInodeByPath(currentParentPath);
+          
+          if (!currentParentIno) {
+            return res.status(500).json({ error: "Errore nella creazione ricorsiva delle directory" });
+          }
+          
+          currentIno = sqliteBackend.createDirectory({
+            path: currentPath,
+            parent_ino: currentParentIno,
+            name: part,
+            mode: mode || 0o755,
+            uid,
+            gid
+          });
+        }
+      }
+      
+      parentIno = sqliteBackend.getInodeByPath(parentPath);
+    }
+    
     if (!parentIno) {
       return res.status(404).json({ error: "Directory padre non trovata" });
     }
@@ -338,7 +355,6 @@ app.post("/open", (req, res) => {
       return res.status(404).json({ error: "File non trovato" });
     }
 
-    // Controlla che non sia una directory (a meno che non sia opendir)
     if (file.file_type === "Directory") {
       return res.status(400).json({ error: "È una directory, usa opendir" });
     }
@@ -394,8 +410,13 @@ app.post('/rename', (req, res) => {
   }
 });
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy', 
+    timestamp: Date.now(),
+    service: 'remote-fs-server',
+    version: '0.1.0'
+  });
 });
 
 // Endpoint per risolvere inode -> path
@@ -433,22 +454,65 @@ app.get("/metadata", (req, res) => {
   }
 });
 
-// Endpoint per aggiornare metadati di un file
-app.patch("/metadata", (req, res) => {
+// Update file metadata endpoint
+app.patch('/metadata', (req, res) => {
   const path = req.query.path as string;
+  
   if (!path) {
-    return res.status(400).json({ error: "Path parameter is required" });
+    return res.status(400).json({ error: 'Path parameter required' });
   }
+
   try {
-    const updatedMetadata = sqliteBackend.updateMetadata(path, req.body);
-    if (!updatedMetadata) {
-      return res.status(404).json({ error: "File not found" });
+    const updates = req.body;
+    
+    const existingMetadata = sqliteBackend.getFileMetadataByPath(path);
+    if (!existingMetadata) {
+      return res.status(404).json({ error: 'File not found' });
     }
+
+    if (updates.size !== undefined) {
+      const newSize = parseInt(updates.size);
+      if (newSize >= 0 && newSize !== existingMetadata.size) {
+        const success = sqliteBackend.truncateFile(path, newSize);
+        if (!success) {
+          return res.status(500).json({ error: 'Failed to truncate file' });
+        }
+      }
+    }
+
+    const metadataUpdates: any = {};
+    if (updates.mode !== undefined && updates.mode !== null) {
+      metadataUpdates.mode = parseInt(updates.mode);
+    }
+    if (updates.uid !== undefined && updates.uid !== null) {
+      metadataUpdates.uid = parseInt(updates.uid);
+    }
+    if (updates.gid !== undefined && updates.gid !== null) {
+      metadataUpdates.gid = parseInt(updates.gid);
+    }
+    if (updates.atime !== undefined && updates.atime !== null) {
+      metadataUpdates.atime = parseInt(updates.atime);
+    }
+    if (updates.mtime !== undefined && updates.mtime !== null) {
+      metadataUpdates.mtime = parseInt(updates.mtime);
+    }
+
+    if (Object.keys(metadataUpdates).length > 0) {
+      const result = sqliteBackend.updateMetadata(path, metadataUpdates);
+      if (!result) {
+        return res.status(500).json({ error: 'Failed to update metadata' });
+      }
+    }
+
+    const updatedMetadata = sqliteBackend.getFileMetadataByPath(path);
     res.json(updatedMetadata);
-  } catch (err) {
+    
+  } catch (error) {
+    console.error('Error updating metadata:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 app.patch('/flush', (req, res) => {
   const { file_handle, filePath } = req.body;
@@ -458,18 +522,15 @@ app.patch('/flush', (req, res) => {
   }
 
   try {
-    // Per le directory, il flush non è necessario
     const metadata = sqliteBackend.getFileMetadataByPath(filePath);
     if (!metadata) {
       return res.status(404).json({ error: "File non trovato" });
     }
 
     if (metadata.file_type === "Directory") {
-      // Per le directory, restituiamo OK senza fare nulla
       return res.status(200).json({ message: "Directory flush completed" });
     }
 
-    // Per i file regolari, aggiorna la dimensione
     sqliteBackend.updateFileSize(filePath);
     res.status(200).json({ message: "File flushed successfully" });
   } catch (err) {

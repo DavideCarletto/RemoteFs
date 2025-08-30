@@ -10,7 +10,6 @@ export interface FileHandle {
   path: string;
 }
 
-// Ottiene UID/GID reali del sistema
 function getSystemUID(): number {
   try {
     const userInfo = os.userInfo();
@@ -29,7 +28,6 @@ function getSystemGID(): number {
   }
 }
 
-// Ottiene timestamp Unix corrente
 function nowUnix(): number {
   return Math.floor(Date.now() / 1000);
 }
@@ -81,7 +79,6 @@ export class SQLiteBackend {
         `);
   }
 
-  //crea struttura base del filesystem (directory root (/), file test.txt di esempio e directory documents)
   initializeDefaultFiles() {
   const rootStmt = this.db.prepare(`
     INSERT OR IGNORE INTO fs_nodes (
@@ -106,15 +103,13 @@ export class SQLiteBackend {
     )
   `);
   const baseText = "Non si intrometta! No, aspetti, mi porga l'indice; ";
-  // Crea un file di test da ~10MB
   const targetSizeMB = 10;
-  const targetSizeBytes = targetSizeMB * 1024 * 1024; // 10MB in bytes
+  const targetSizeBytes = targetSizeMB * 1024 ;
   const repeatCount = Math.ceil(targetSizeBytes / baseText.length);
   const testContent = Buffer.from(baseText.repeat(repeatCount));
   
   testFileStmt.run(testContent.length, Math.ceil(testContent.length / 512));
 
-  // Crea il file fisico per test.txt
   const testFilePath = `${this.filesystemDir}/2`;
   if (!fs.existsSync(testFilePath)) {
     fs.writeFileSync(testFilePath, testContent);
@@ -533,5 +528,49 @@ export class SQLiteBackend {
 
   closeFile(fileHandle: number): void {
     this.openFiles.delete(fileHandle);
+  }
+
+  // Tronca un file alla dimensione specificata
+  truncateFile(path: string, newSize: number): boolean {
+    try {
+      const metadata = this.getFileMetadataByPath(path);
+      if (!metadata) {
+        console.error(`File ${path} non trovato nei metadati`);
+        return false;
+      }
+
+      if (metadata.file_type !== 'RegularFile') {
+        console.error(`${path} non è un file regolare`);
+        return false;
+      }
+
+      const physicalPath = `${this.filesystemDir}/${metadata.ino}`;
+      
+      if (!fs.existsSync(physicalPath)) {
+        fs.writeFileSync(physicalPath, Buffer.alloc(0));
+      }
+
+      fs.truncateSync(physicalPath, newSize);
+
+      const now = nowUnix();
+      const stmt = this.db.prepare(`
+        UPDATE fs_nodes 
+        SET size = ?, mtime = ?
+        WHERE path = ?
+      `);
+      
+      const result = stmt.run(newSize, now, path);
+      
+      if (result.changes > 0) {
+        return true;
+      } else {
+        console.error(`Impossibile aggiornare metadati per ${path}`);
+        return false;
+      }
+      
+    } catch (error) {
+      console.error(`Errore troncamento file ${path}:`, error);
+      return false;
+    }
   }
 }
